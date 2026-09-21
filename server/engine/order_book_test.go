@@ -136,7 +136,7 @@ func BenchmarkProcessOrder(b *testing.B) {
 			ID:        uint64(i + 1),
 			Symbol:    "AAPL",
 			Side:      Sell,
-			Price:     uint64(100 + (i % 10)), // Prices between 100 and 109
+			Price:     uint64(100 + (i % 10)),
 			Amount:    10,
 			Timestamp: int64(i),
 		})
@@ -144,8 +144,8 @@ func BenchmarkProcessOrder(b *testing.B) {
 
 	b.ResetTimer()
 
-	// Benchmark incoming Buy orders matching against the book
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		ob.ProcessOrder(&Order{
 			ID:        uint64(10000 + i),
 			Symbol:    "AAPL",
@@ -154,5 +154,6 @@ func BenchmarkProcessOrder(b *testing.B) {
 			Amount:    1,
 			Timestamp: int64(i),
 		})
+		i++
 	}
 }

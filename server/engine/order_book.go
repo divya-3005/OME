@@ -1,6 +1,6 @@
 package engine
 
-import "time" // Make sure "time" is imported at the top of order_book.go!
+import "time"
 
 // OrderBook manages all bids, asks, and order lookups for a single symbol
 type OrderBook struct {
