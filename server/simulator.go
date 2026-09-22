@@ -104,7 +104,12 @@ func (sim *MarketSimulator) Start() {
 				orderID++
 				symbol := symbols[rand.Intn(len(symbols))]
 				ob, exists := sim.eng.GetOrderBook(symbol)
-				if !exists || len(ob.Bids) == 0 || len(ob.Asks) == 0 {
+				if !exists {
+					continue
+				}
+
+				bestBid, bestAsk, ok := ob.GetBestBidAsk()
+				if !ok {
 					continue
 				}
 
@@ -117,16 +122,16 @@ func (sim *MarketSimulator) Start() {
 				if side == engine.Buy {
 					// Buy near best ask to trigger trade, or near best bid to add liquidity
 					if isMarket || rand.Float32() < 0.4 {
-						price = ob.Asks[0].Price
+						price = bestAsk
 					} else {
-						price = ob.Bids[0].Price - uint64(rand.Intn(30))
+						price = bestBid - uint64(rand.Intn(30))
 					}
 				} else {
 					// Sell near best bid to trigger trade, or near best ask to add liquidity
 					if isMarket || rand.Float32() < 0.4 {
-						price = ob.Bids[0].Price
+						price = bestBid
 					} else {
-						price = ob.Asks[0].Price + uint64(rand.Intn(30))
+						price = bestAsk + uint64(rand.Intn(30))
 					}
 				}
 
@@ -162,11 +167,10 @@ func (sim *MarketSimulator) Start() {
 // Toggle toggles the simulator on or off
 func (sim *MarketSimulator) Toggle() bool {
 	sim.mu.Lock()
-	defer sim.mu.Unlock()
-
 	if sim.running {
 		close(sim.stop)
 		sim.running = false
+		sim.mu.Unlock()
 		return false
 	}
 

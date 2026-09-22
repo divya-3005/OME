@@ -38,9 +38,12 @@ func main() {
 	sim := NewMarketSimulator(eng, hub, wal)
 
 	// If books are empty, seed them with realistic liquidity
-	if ob, exists := eng.GetOrderBook("AAPL"); exists && len(ob.Bids) == 0 {
-		log.Println("Seeding market with initial liquidity...")
-		sim.SeedMarket()
+	if ob, exists := eng.GetOrderBook("AAPL"); exists {
+		bids, _ := ob.GetSnapshot()
+		if len(bids) == 0 {
+			log.Println("Seeding market with initial liquidity...")
+			sim.SeedMarket()
+		}
 	}
 
 	// Start live background bot simulation
@@ -177,11 +180,6 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 
 // handleGetOrderBook returns a snapshot of bids and asks for GET /orderbook?symbol=AAPL
 func handleGetOrderBook(eng *engine.Engine) http.HandlerFunc {
-	type LevelSummary struct {
-		Price  uint64 `json:"price"`
-		Volume uint64 `json:"volume"`
-	}
-
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
 		ob, exists := eng.GetOrderBook(symbol)
@@ -190,15 +188,7 @@ func handleGetOrderBook(eng *engine.Engine) http.HandlerFunc {
 			return
 		}
 
-		bids := make([]LevelSummary, 0, len(ob.Bids))
-		for _, b := range ob.Bids {
-			bids = append(bids, LevelSummary{Price: b.Price, Volume: b.TotalVolume})
-		}
-
-		asks := make([]LevelSummary, 0, len(ob.Asks))
-		for _, a := range ob.Asks {
-			asks = append(asks, LevelSummary{Price: a.Price, Volume: a.TotalVolume})
-		}
+		bids, asks := ob.GetSnapshot()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{

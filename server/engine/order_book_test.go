@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -200,4 +201,52 @@ func TestMarketOrder(t *testing.T) {
 		t.Errorf("market order should not rest on the book")
 	}
 }
+
+func TestConcurrentOrders(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+	const numGoroutines = 16
+	const ordersPerGoroutine = 200
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for g := 0; g < numGoroutines; g++ {
+		go func(routineID int) {
+			defer wg.Done()
+			for i := 0; i < ordersPerGoroutine; i++ {
+				orderID := uint64(routineID*100000 + i + 1)
+				side := Buy
+				if i%2 == 0 {
+					side = Sell
+				}
+				price := uint64(100 + (i % 20))
+
+				// Submit Limit order
+				ob.ProcessOrder(&Order{
+					ID:        orderID,
+					Symbol:    "AAPL",
+					Side:      side,
+					Type:      Limit,
+					Price:     price,
+					Amount:    5,
+					Timestamp: time.Now().UnixNano(),
+				})
+
+				// Concurrently read snapshot and top-of-book
+				if i%10 == 0 {
+					ob.GetSnapshot()
+					ob.GetBestBidAsk()
+				}
+
+				// Concurrently cancel some orders
+				if i%4 == 0 {
+					ob.CancelOrder(orderID)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+}
+
 

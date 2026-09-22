@@ -100,6 +100,13 @@ func (w *WAL) Recover(eng *Engine) error {
 	return scanner.Err()
 }
 
+// Sync commits the current contents of the WAL file to stable disk storage
+func (w *WAL) Sync() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Sync()
+}
+
 // Close closes the WAL file
 func (w *WAL) Close() error {
 	return w.file.Close()
