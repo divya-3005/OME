@@ -7,7 +7,7 @@
   
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   
   <link rel="stylesheet" href="style.css">
 </head>
@@ -177,16 +177,29 @@
       </div>
     </section>
 
-    <!-- CENTER: Live L2 Order Book & Canvas Depth Chart -->
+    <!-- CENTER: Candlestick Chart & L2 Order Book -->
     <section class="panel order-book-panel">
-      <div class="panel-header">
-        <span class="panel-title">ORDER BOOK & MARKET DEPTH</span>
-        <span class="depth-unit">DEPTH: 1000 HZ</span>
+      <!-- Chart Controls Header -->
+      <div class="chart-header">
+        <div class="chart-mode-tabs">
+          <button class="chart-tab active" id="tabChartPrice">📈 PRICE CANDLES</button>
+          <button class="chart-tab" id="tabChartDepth">📊 MARKET DEPTH</button>
+        </div>
+
+        <!-- OHLC Live Stats Bar -->
+        <div class="ohlc-bar" id="ohlcBar">
+          <span>O: <b id="ohlcOpen">150.00</b></span>
+          <span>H: <b id="ohlcHigh">150.50</b></span>
+          <span>L: <b id="ohlcLow">149.80</b></span>
+          <span>C: <b id="ohlcClose" class="text-green">150.25</b></span>
+          <span>V: <b id="ohlcVol">14.2K</b></span>
+        </div>
       </div>
 
-      <!-- Real-Time Liquidity Depth Chart (Canvas) -->
-      <div class="depth-chart-wrapper">
-        <canvas id="depthChart" width="500" height="110"></canvas>
+      <!-- Canvas Charts Container -->
+      <div class="chart-canvas-container">
+        <canvas id="priceChartCanvas"></canvas>
+        <canvas id="depthChartCanvas" style="display: none;"></canvas>
       </div>
 
       <div class="order-book-table-header">

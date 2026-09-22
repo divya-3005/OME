@@ -1,9 +1,10 @@
 // ==========================================================================
-// OME // Institutional Trading Terminal Controller (v2.0)
+// OME // Institutional Trading Terminal Controller & Dual-Chart Engine (v2.0)
 // ==========================================================================
 
 const state = {
   activeSymbol: 'AAPL',
+  activeChartTab: 'price', // 'price' | 'depth'
   side: 0, // 0 = Buy, 1 = Sell
   type: 0, // 0 = Limit, 1 = Market
   myOrders: [],
@@ -16,7 +17,10 @@ const state = {
     volume: 1420580,
     tradesCount: 0,
     openPrice: 147.85,
-  }
+  },
+  lastBook: { bids: [], asks: [] },
+  hoverPriceChart: null, // { x, y } when mouse is over price canvas
+  hoverDepthChart: null, // { x, y } when mouse is over depth canvas
 };
 
 // DOM Elements
@@ -40,7 +44,19 @@ const tradesStream = document.getElementById('tradesStream');
 const ordersTableBody = document.getElementById('ordersTableBody');
 const openOrdersCount = document.getElementById('openOrdersCount');
 const wsStatus = document.getElementById('wsStatus');
-const depthCanvas = document.getElementById('depthChart');
+
+// Chart Elements
+const tabChartPrice = document.getElementById('tabChartPrice');
+const tabChartDepth = document.getElementById('tabChartDepth');
+const priceCanvas = document.getElementById('priceChartCanvas');
+const depthCanvas = document.getElementById('depthChartCanvas');
+const ohlcOpen = document.getElementById('ohlcOpen');
+const ohlcHigh = document.getElementById('ohlcHigh');
+const ohlcLow = document.getElementById('ohlcLow');
+const ohlcClose = document.getElementById('ohlcClose');
+const ohlcVol = document.getElementById('ohlcVol');
+
+// Bot & Audio Elements
 const btnToggleBot = document.getElementById('btnToggleBot');
 const botLabel = document.getElementById('botLabel');
 const btnToggleAudio = document.getElementById('btnToggleAudio');
@@ -54,7 +70,599 @@ const tickerVolume = document.getElementById('tickerVolume');
 const tickerTradesCount = document.getElementById('tickerTradesCount');
 
 // --------------------------------------------------------------------------
-// 1. Web Audio Synthesizer (Trade Execution Chime)
+// 1. Candlestick Data Store & Historical Seeder
+// --------------------------------------------------------------------------
+const CANDLE_PERIOD_MS = 15000; // 15-second candle resolution for live action
+const candles = {
+  'AAPL': [],
+  'TSLA': [],
+  'BTC-USD': [],
+};
+
+function seedHistoricalCandles(symbol, basePrice, volatility, count = 48) {
+  const list = [];
+  let currentPrice = basePrice;
+  const now = Date.now();
+  const startTime = now - count * CANDLE_PERIOD_MS;
+
+  for (let i = 0; i < count; i++) {
+    const time = startTime + i * CANDLE_PERIOD_MS;
+    const change = (Math.random() - 0.49) * volatility;
+    const open = currentPrice;
+    const close = Math.max(open + change, basePrice * 0.5);
+    const high = Math.max(open, close) + Math.random() * (volatility * 0.7);
+    const low = Math.min(open, close) - Math.random() * (volatility * 0.7);
+    const volume = Math.floor(Math.random() * 8000) + 1200;
+
+    list.push({
+      time,
+      open: parseFloat(open.toFixed(2)),
+      high: parseFloat(high.toFixed(2)),
+      low: parseFloat(low.toFixed(2)),
+      close: parseFloat(close.toFixed(2)),
+      volume,
+    });
+
+    currentPrice = close;
+  }
+  return list;
+}
+
+// Initialize seed data
+candles['AAPL'] = seedHistoricalCandles('AAPL', 150.00, 0.45);
+candles['TSLA'] = seedHistoricalCandles('TSLA', 240.00, 1.20);
+candles['BTC-USD'] = seedHistoricalCandles('BTC-USD', 64000.00, 150.00);
+
+function updateCandleOnTrade(symbol, price, amount) {
+  const list = candles[symbol];
+  if (!list || list.length === 0) return;
+
+  const now = Date.now();
+  const last = list[list.length - 1];
+
+  if (now - last.time > CANDLE_PERIOD_MS) {
+    // Roll into new candle
+    list.push({
+      time: now,
+      open: last.close,
+      high: Math.max(last.close, price),
+      low: Math.min(last.close, price),
+      close: price,
+      volume: amount,
+    });
+    if (list.length > 80) list.shift();
+  } else {
+    // Update active candle
+    last.high = Math.max(last.high, price);
+    last.low = Math.min(last.low, price);
+    last.close = price;
+    last.volume += amount;
+  }
+
+  updateOHLCHeader();
+  if (state.activeChartTab === 'price') {
+    renderPriceChart();
+  }
+}
+
+function updateOHLCHeader(customCandle = null) {
+  const list = candles[state.activeSymbol];
+  if (!list || list.length === 0) return;
+  const c = customCandle || list[list.length - 1];
+
+  ohlcOpen.textContent = c.open.toFixed(2);
+  ohlcHigh.textContent = c.high.toFixed(2);
+  ohlcLow.textContent = c.low.toFixed(2);
+  ohlcClose.textContent = c.close.toFixed(2);
+
+  const isBull = c.close >= c.open;
+  ohlcClose.className = isBull ? 'text-green' : 'text-red';
+
+  if (ohlcVol) {
+    ohlcVol.textContent = c.volume >= 1000 
+      ? (c.volume / 1000).toFixed(1) + 'K' 
+      : c.volume.toString();
+  }
+}
+
+// --------------------------------------------------------------------------
+// 2. High-DPI Canvas Helper
+// --------------------------------------------------------------------------
+function setupCanvasDPI(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.floor(rect.width);
+  const h = Math.floor(rect.height);
+
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+  }
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, width: w, height: h };
+}
+
+// --------------------------------------------------------------------------
+// 3. Japanese Candlestick & Volume Chart Engine
+// --------------------------------------------------------------------------
+function renderPriceChart() {
+  if (!priceCanvas || state.activeChartTab !== 'price') return;
+  const { ctx, width, height } = setupCanvasDPI(priceCanvas);
+
+  ctx.clearRect(0, 0, width, height);
+
+  const list = candles[state.activeSymbol];
+  if (!list || list.length === 0) return;
+
+  const rightMargin = 70;
+  const bottomMargin = 22;
+  const chartW = width - rightMargin;
+  const chartH = height - bottomMargin;
+
+  // Price & Volume domain calculations
+  let minPrice = Infinity;
+  let maxPrice = -Infinity;
+  let maxVol = 1;
+
+  list.forEach(c => {
+    if (c.low < minPrice) minPrice = c.low;
+    if (c.high > maxPrice) maxPrice = c.high;
+    if (c.volume > maxVol) maxVol = c.volume;
+  });
+
+  // Add 4% padding to price bounds
+  const pricePadding = (maxPrice - minPrice) * 0.08 || 1;
+  const pMin = minPrice - pricePadding;
+  const pMax = maxPrice + pricePadding;
+  const pRange = pMax - pMin;
+
+  const volH = chartH * 0.22;
+  const candleAreaH = chartH * 0.78;
+
+  function priceToY(p) {
+    return candleAreaH - ((p - pMin) / pRange) * candleAreaH;
+  }
+
+  function yToPrice(y) {
+    return pMax - (y / candleAreaH) * pRange;
+  }
+
+  // 1. Draw Subtle Grid Lines & Price Labels
+  const gridCount = 5;
+  ctx.lineWidth = 1;
+  ctx.font = '10px "JetBrains Mono", monospace';
+
+  for (let i = 0; i <= gridCount; i++) {
+    const y = (candleAreaH / gridCount) * i;
+    const priceAtY = yToPrice(y);
+
+    // Horizontal grid line
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(chartW, y);
+    ctx.stroke();
+
+    // Price label on right axis
+    ctx.fillStyle = '#64748b';
+    ctx.textAlign = 'left';
+    ctx.fillText(`$${priceAtY.toFixed(2)}`, chartW + 8, y + 3);
+  }
+
+  // Vertical Separator for Axis
+  ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+  ctx.beginPath();
+  ctx.moveTo(chartW, 0);
+  ctx.lineTo(chartW, height);
+  ctx.stroke();
+
+  // Bottom Timeline Separator
+  ctx.beginPath();
+  ctx.moveTo(0, chartH);
+  ctx.lineTo(width, chartH);
+  ctx.stroke();
+
+  // 2. Draw Candlesticks & Volume Bars
+  const numCandles = list.length;
+  const slotW = chartW / numCandles;
+  const candleW = Math.max(3, slotW * 0.68);
+
+  list.forEach((c, idx) => {
+    const x = idx * slotW + slotW / 2;
+    const isBull = c.close >= c.open;
+    const color = isBull ? '#00f090' : '#ff3358';
+    const volColor = isBull ? 'rgba(0, 240, 144, 0.22)' : 'rgba(255, 51, 88, 0.22)';
+
+    // Volume Bar
+    const vBarH = Math.max(1, (c.volume / maxVol) * volH);
+    const vY = chartH - vBarH;
+    ctx.fillStyle = volColor;
+    ctx.fillRect(x - candleW / 2, vY, candleW, vBarH);
+
+    // Candle Wick
+    const yHigh = priceToY(c.high);
+    const yLow = priceToY(c.low);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(x, yHigh);
+    ctx.lineTo(x, yLow);
+    ctx.stroke();
+
+    // Candle Body
+    const yOpen = priceToY(c.open);
+    const yClose = priceToY(c.close);
+    const bodyTop = Math.min(yOpen, yClose);
+    const bodyH = Math.max(Math.abs(yClose - yOpen), 1.5);
+
+    ctx.fillStyle = color;
+    ctx.fillRect(x - candleW / 2, bodyTop, candleW, bodyH);
+
+    // Time Label (Every ~10 candles)
+    if (idx % 10 === 0) {
+      const timeStr = new Date(c.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      ctx.fillStyle = '#475569';
+      ctx.textAlign = 'center';
+      ctx.fillText(timeStr, x, chartH + 15);
+    }
+  });
+
+  // 3. Live Price Line & Glowing Badge
+  const lastCandle = list[list.length - 1];
+  const lastY = priceToY(lastCandle.close);
+  const liveColor = lastCandle.close >= lastCandle.open ? '#00f090' : '#ff3358';
+
+  ctx.strokeStyle = liveColor;
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, lastY);
+  ctx.lineTo(chartW, lastY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Live Price Badge on Axis
+  const badgeW = 62;
+  const badgeH = 18;
+  ctx.fillStyle = liveColor;
+  ctx.beginPath();
+  ctx.roundRect(chartW + 4, lastY - badgeH / 2, badgeW, badgeH, 3);
+  ctx.fill();
+
+  ctx.fillStyle = '#000000';
+  ctx.font = 'bold 10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`$${lastCandle.close.toFixed(2)}`, chartW + 4 + badgeW / 2, lastY + 3.5);
+
+  // 4. Interactive Hover Crosshair
+  if (state.hoverPriceChart) {
+    const { x, y } = state.hoverPriceChart;
+
+    if (x <= chartW && y <= chartH) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
+
+      // Vertical line
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, chartH);
+      ctx.stroke();
+
+      // Horizontal line
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(chartW, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Price Tag on Right Axis
+      const hoverPrice = yToPrice(y);
+      ctx.fillStyle = '#1e293b';
+      ctx.strokeStyle = '#475569';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(chartW + 4, y - badgeH / 2, badgeW, badgeH, 3);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#e2e8f0';
+      ctx.font = '10px "JetBrains Mono", monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(`$${hoverPrice.toFixed(2)}`, chartW + 4 + badgeW / 2, y + 3.5);
+
+      // Find hovered candle and update OHLC
+      const hoveredIdx = Math.floor(x / slotW);
+      if (hoveredIdx >= 0 && hoveredIdx < list.length) {
+        updateOHLCHeader(list[hoveredIdx]);
+      }
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// 4. Step-Staircase Market Depth Chart Engine
+// --------------------------------------------------------------------------
+function drawDepthChart(bids, asks) {
+  state.lastBook = { bids: bids || [], asks: asks || [] };
+  if (!depthCanvas || state.activeChartTab !== 'depth') return;
+
+  const { ctx, width, height } = setupCanvasDPI(depthCanvas);
+  ctx.clearRect(0, 0, width, height);
+
+  if (bids.length === 0 && asks.length === 0) {
+    ctx.fillStyle = '#475569';
+    ctx.font = '11px "Plus Jakarta Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for Order Book Depth...', width / 2, height / 2);
+    return;
+  }
+
+  // Cumulative depth preparation
+  let cumBids = [];
+  let totalBid = 0;
+  bids.slice(0, 24).forEach(b => {
+    totalBid += b.volume;
+    cumBids.push({ price: b.price / 100, cum: totalBid, volume: b.volume });
+  });
+
+  let cumAsks = [];
+  let totalAsk = 0;
+  asks.slice(0, 24).forEach(a => {
+    totalAsk += a.volume;
+    cumAsks.push({ price: a.price / 100, cum: totalAsk, volume: a.volume });
+  });
+
+  const maxCum = Math.max(totalBid, totalAsk, 100);
+  const midX = width / 2;
+  const paddingBottom = 24;
+  const drawH = height - paddingBottom;
+
+  // 1. Draw Subtle Depth Grid
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
+  ctx.setLineDash([3, 3]);
+  ctx.lineWidth = 1;
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.fillStyle = '#64748b';
+
+  const volSteps = 4;
+  for (let i = 1; i <= volSteps; i++) {
+    const y = drawH - (i / volSteps) * (drawH - 12);
+    const volVal = Math.round((i / volSteps) * maxCum);
+
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.stroke();
+
+    ctx.textAlign = 'left';
+    ctx.fillText(`${volVal.toLocaleString()}`, 8, y - 3);
+  }
+  ctx.setLineDash([]);
+
+  // 2. Draw Bids Step-Staircase Curve (Green, Left)
+  if (cumBids.length > 0) {
+    ctx.beginPath();
+    ctx.moveTo(midX, drawH);
+
+    // Initial step at best bid
+    const bestBidY = drawH - (cumBids[0].cum / maxCum) * (drawH - 14);
+    ctx.lineTo(midX, bestBidY);
+
+    for (let i = 0; i < cumBids.length; i++) {
+      const nextX = midX - ((i + 1) / cumBids.length) * midX;
+      const currentY = drawH - (cumBids[i].cum / maxCum) * (drawH - 14);
+
+      // Horizontal step to price level
+      ctx.lineTo(nextX, currentY);
+
+      // Vertical step to next cumulative depth if available
+      if (i < cumBids.length - 1) {
+        const nextY = drawH - (cumBids[i + 1].cum / maxCum) * (drawH - 14);
+        ctx.lineTo(nextX, nextY);
+      }
+    }
+
+    ctx.lineTo(0, drawH);
+    ctx.closePath();
+
+    // Gradient fill
+    const bidGrad = ctx.createLinearGradient(0, 0, 0, drawH);
+    bidGrad.addColorStop(0, 'rgba(0, 240, 144, 0.28)');
+    bidGrad.addColorStop(1, 'rgba(0, 240, 144, 0.01)');
+    ctx.fillStyle = bidGrad;
+    ctx.fill();
+
+    // Step border stroke
+    ctx.strokeStyle = '#00f090';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // 3. Draw Asks Step-Staircase Curve (Red, Right)
+  if (cumAsks.length > 0) {
+    ctx.beginPath();
+    ctx.moveTo(midX, drawH);
+
+    // Initial step at best ask
+    const bestAskY = drawH - (cumAsks[0].cum / maxCum) * (drawH - 14);
+    ctx.lineTo(midX, bestAskY);
+
+    for (let i = 0; i < cumAsks.length; i++) {
+      const nextX = midX + ((i + 1) / cumAsks.length) * midX;
+      const currentY = drawH - (cumAsks[i].cum / maxCum) * (drawH - 14);
+
+      // Horizontal step to price level
+      ctx.lineTo(nextX, currentY);
+
+      // Vertical step to next cumulative depth if available
+      if (i < cumAsks.length - 1) {
+        const nextY = drawH - (cumAsks[i + 1].cum / maxCum) * (drawH - 14);
+        ctx.lineTo(nextX, nextY);
+      }
+    }
+
+    ctx.lineTo(width, drawH);
+    ctx.closePath();
+
+    // Gradient fill
+    const askGrad = ctx.createLinearGradient(0, 0, 0, drawH);
+    askGrad.addColorStop(0, 'rgba(255, 51, 88, 0.28)');
+    askGrad.addColorStop(1, 'rgba(255, 51, 88, 0.01)');
+    ctx.fillStyle = askGrad;
+    ctx.fill();
+
+    // Step border stroke
+    ctx.strokeStyle = '#ff3358';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // 4. Center Mid-Market Line
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(midX, 0);
+  ctx.lineTo(midX, drawH);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 5. Price Axis at Bottom
+  ctx.fillStyle = '#64748b';
+  ctx.font = '10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+
+  if (cumBids.length > 0) {
+    const deepestBid = cumBids[cumBids.length - 1].price;
+    const bestBid = cumBids[0].price;
+    ctx.fillText(`$${deepestBid.toFixed(2)}`, 30, height - 8);
+    ctx.fillText(`$${bestBid.toFixed(2)}`, midX - 45, height - 8);
+  }
+
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText('MID SPREAD', midX, height - 8);
+
+  if (cumAsks.length > 0) {
+    const bestAsk = cumAsks[0].price;
+    const deepestAsk = cumAsks[cumAsks.length - 1].price;
+    ctx.fillStyle = '#64748b';
+    ctx.fillText(`$${bestAsk.toFixed(2)}`, midX + 45, height - 8);
+    ctx.fillText(`$${deepestAsk.toFixed(2)}`, width - 35, height - 8);
+  }
+
+  // 6. Interactive Depth Hover Tooltip
+  if (state.hoverDepthChart) {
+    const { x, y } = state.hoverDepthChart;
+    if (y <= drawH) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.setLineDash([2, 2]);
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, drawH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const isBid = x < midX;
+      let depthText = '';
+      if (isBid && cumBids.length > 0) {
+        const idx = Math.min(Math.floor(((midX - x) / midX) * cumBids.length), cumBids.length - 1);
+        const item = cumBids[idx];
+        depthText = `BID: $${item.price.toFixed(2)} | DEPTH: ${item.cum.toLocaleString()}`;
+      } else if (!isBid && cumAsks.length > 0) {
+        const idx = Math.min(Math.floor(((x - midX) / midX) * cumAsks.length), cumAsks.length - 1);
+        const item = cumAsks[idx];
+        depthText = `ASK: $${item.price.toFixed(2)} | DEPTH: ${item.cum.toLocaleString()}`;
+      }
+
+      if (depthText) {
+        ctx.font = '10px "JetBrains Mono", monospace';
+        const txtW = ctx.measureText(depthText).width + 16;
+        const boxX = Math.max(10, Math.min(width - txtW - 10, x - txtW / 2));
+        const boxY = Math.max(10, y - 28);
+
+        ctx.fillStyle = '#0f172a';
+        ctx.strokeStyle = isBid ? '#00f090' : '#ff3358';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(boxX, boxY, txtW, 20, 4);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = '#f8fafc';
+        ctx.textAlign = 'center';
+        ctx.fillText(depthText, boxX + txtW / 2, boxY + 13.5);
+      }
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// 5. Chart Interaction & Tab Switchers
+// --------------------------------------------------------------------------
+tabChartPrice.addEventListener('click', () => {
+  state.activeChartTab = 'price';
+  tabChartPrice.classList.add('active');
+  tabChartDepth.classList.remove('active');
+  priceCanvas.style.display = 'block';
+  depthCanvas.style.display = 'none';
+  renderPriceChart();
+});
+
+tabChartDepth.addEventListener('click', () => {
+  state.activeChartTab = 'depth';
+  tabChartDepth.classList.add('active');
+  tabChartPrice.classList.remove('active');
+  priceCanvas.style.display = 'none';
+  depthCanvas.style.display = 'block';
+  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+});
+
+// Price Canvas Mouse Events
+priceCanvas.addEventListener('mousemove', (e) => {
+  const rect = priceCanvas.getBoundingClientRect();
+  state.hoverPriceChart = {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  };
+  renderPriceChart();
+});
+
+priceCanvas.addEventListener('mouseleave', () => {
+  state.hoverPriceChart = null;
+  updateOHLCHeader();
+  renderPriceChart();
+});
+
+// Depth Canvas Mouse Events
+depthCanvas.addEventListener('mousemove', (e) => {
+  const rect = depthCanvas.getBoundingClientRect();
+  state.hoverDepthChart = {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  };
+  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+});
+
+depthCanvas.addEventListener('mouseleave', () => {
+  state.hoverDepthChart = null;
+  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+});
+
+// Responsive resize listener
+window.addEventListener('resize', () => {
+  if (state.activeChartTab === 'price') {
+    renderPriceChart();
+  } else {
+    drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+  }
+});
+
+// --------------------------------------------------------------------------
+// 6. Web Audio Synthesizer (Trade Execution Chime)
 // --------------------------------------------------------------------------
 let audioCtx = null;
 function playTradeSound() {
@@ -79,12 +687,12 @@ function playTradeSound() {
     osc.start();
     osc.stop(audioCtx.currentTime + 0.05);
   } catch (e) {
-    // Handled gracefully if browser policy blocks audio before gesture
+    // Handled gracefully if browser policy blocks audio before user interaction
   }
 }
 
 // --------------------------------------------------------------------------
-// 2. WebSocket Connection & Auto-Reconnect
+// 7. WebSocket Connection & Auto-Reconnect
 // --------------------------------------------------------------------------
 function connectWebSocket() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -114,7 +722,11 @@ function connectWebSocket() {
 
 function handleServerEvent(msg) {
   if (msg.type === 'trades' && msg.symbol === state.activeSymbol) {
-    msg.data.forEach(appendTrade);
+    msg.data.forEach(trade => {
+      appendTrade(trade);
+      const p = trade.price / 100;
+      updateCandleOnTrade(state.activeSymbol, p, trade.amount);
+    });
     fetchOrderBook();
     updateOpenOrdersAfterMatch(msg.data);
     playTradeSound();
@@ -124,7 +736,7 @@ function handleServerEvent(msg) {
 }
 
 // --------------------------------------------------------------------------
-// 3. Fetch & Render L2 Order Book & Canvas Depth Chart
+// 8. Fetch & Render L2 Order Book
 // --------------------------------------------------------------------------
 async function fetchOrderBook() {
   try {
@@ -208,89 +820,6 @@ function renderOrderBook(data) {
   }
 }
 
-// --------------------------------------------------------------------------
-// 4. HTML5 Canvas Depth Chart Visualizer
-// --------------------------------------------------------------------------
-function drawDepthChart(bids, asks) {
-  if (!depthCanvas) return;
-  const ctx = depthCanvas.getContext('2d');
-  const w = depthCanvas.width;
-  const h = depthCanvas.height;
-
-  ctx.clearRect(0, 0, w, h);
-
-  if (bids.length === 0 && asks.length === 0) return;
-
-  let cumBids = [];
-  let totalBid = 0;
-  bids.slice(0, 20).forEach(b => {
-    totalBid += b.volume;
-    cumBids.push({ price: b.price, cum: totalBid });
-  });
-
-  let cumAsks = [];
-  let totalAsk = 0;
-  asks.slice(0, 20).forEach(a => {
-    totalAsk += a.volume;
-    cumAsks.push({ price: a.price, cum: totalAsk });
-  });
-
-  const maxVol = Math.max(totalBid, totalAsk, 1);
-  const midX = w / 2;
-
-  // Draw Bids (Left side, Green)
-  if (cumBids.length > 0) {
-    ctx.beginPath();
-    ctx.moveTo(0, h);
-
-    cumBids.forEach((b, i) => {
-      const x = midX - (i / cumBids.length) * midX;
-      const y = h - (b.cum / maxVol) * (h - 10);
-      ctx.lineTo(x, y);
-    });
-
-    ctx.lineTo(midX, h - (cumBids[0].cum / maxVol) * (h - 10));
-    ctx.lineTo(midX, h);
-    ctx.closePath();
-
-    const bidGrad = ctx.createLinearGradient(0, 0, 0, h);
-    bidGrad.addColorStop(0, 'rgba(0, 240, 144, 0.3)');
-    bidGrad.addColorStop(1, 'rgba(0, 240, 144, 0.02)');
-    ctx.fillStyle = bidGrad;
-    ctx.fill();
-
-    ctx.strokeStyle = '#00f090';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-  }
-
-  // Draw Asks (Right side, Red)
-  if (cumAsks.length > 0) {
-    ctx.beginPath();
-    ctx.moveTo(midX, h);
-
-    cumAsks.forEach((a, i) => {
-      const x = midX + (i / cumAsks.length) * midX;
-      const y = h - (a.cum / maxVol) * (h - 10);
-      ctx.lineTo(x, y);
-    });
-
-    ctx.lineTo(w, h - (cumAsks[cumAsks.length - 1].cum / maxVol) * (h - 10));
-    ctx.lineTo(w, h);
-    ctx.closePath();
-
-    const askGrad = ctx.createLinearGradient(0, 0, 0, h);
-    askGrad.addColorStop(0, 'rgba(255, 51, 88, 0.3)');
-    askGrad.addColorStop(1, 'rgba(255, 51, 88, 0.02)');
-    ctx.fillStyle = askGrad;
-    ctx.fill();
-
-    ctx.strokeStyle = '#ff3358';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-  }
-}
-
 // Click-to-fill
 window.setPrice = function(price) {
   if (state.type === 0) {
@@ -300,7 +829,7 @@ window.setPrice = function(price) {
 };
 
 // --------------------------------------------------------------------------
-// 5. Trade Stream & 24h Ticker Updates
+// 9. Trade Stream & 24h Ticker Updates
 // --------------------------------------------------------------------------
 function appendTrade(trade) {
   const price = (trade.price / 100).toFixed(2);
@@ -348,7 +877,7 @@ function appendTrade(trade) {
 }
 
 // --------------------------------------------------------------------------
-// 6. Order Submission & State
+// 10. Order Submission & State
 // --------------------------------------------------------------------------
 async function submitOrder() {
   const amount = parseInt(inputAmount.value, 10);
@@ -405,7 +934,7 @@ async function submitOrder() {
 }
 
 // --------------------------------------------------------------------------
-// 7. Open Orders Table & 1-Click Cancel
+// 11. Open Orders Table & 1-Click Cancel
 // --------------------------------------------------------------------------
 function renderOpenOrders() {
   const currentSymbolOrders = state.myOrders.filter(o => o.symbol === state.activeSymbol);
@@ -464,7 +993,7 @@ function updateOpenOrdersAfterMatch(trades) {
 }
 
 // --------------------------------------------------------------------------
-// 8. UI Controls & Event Listeners
+// 12. UI Controls & Event Listeners
 // --------------------------------------------------------------------------
 function updateTotal() {
   const price = parseFloat(inputPrice.value) || 0;
@@ -548,6 +1077,10 @@ symbolTabs.addEventListener('click', (e) => {
   }
 
   updateTotal();
+  updateOHLCHeader();
+  if (state.activeChartTab === 'price') {
+    renderPriceChart();
+  }
   fetchOrderBook();
   renderOpenOrders();
 });
@@ -577,7 +1110,9 @@ btnToggleAudio.addEventListener('click', () => {
 btnSubmitOrder.addEventListener('click', submitOrder);
 
 // --------------------------------------------------------------------------
-// Initialization
+// 13. Initialization
 // --------------------------------------------------------------------------
 connectWebSocket();
 updateTotal();
+updateOHLCHeader();
+renderPriceChart();
