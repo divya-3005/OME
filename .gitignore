@@ -18,3 +18,5 @@ bin/
 *.swp
 *.swo
 .DS_Store
+*.log
+wal.log
