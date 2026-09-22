@@ -3,18 +3,38 @@ package engine
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // Engine manages multiple OrderBooks across different trading symbols
 type Engine struct {
-	mu         sync.RWMutex
-	orderBooks map[string]*OrderBook
+	mu          sync.RWMutex
+	orderBooks  map[string]*OrderBook
+	nextOrderID uint64
 }
 
 // NewEngine initializes an empty exchange engine
 func NewEngine() *Engine {
 	return &Engine{
 		orderBooks: make(map[string]*OrderBook),
+	}
+}
+
+// NextOrderID generates a monotonic unique order ID across all symbols
+func (e *Engine) NextOrderID() uint64 {
+	return atomic.AddUint64(&e.nextOrderID, 1)
+}
+
+// SetMinOrderID ensures the order ID generator never produces an ID <= minID
+func (e *Engine) SetMinOrderID(minID uint64) {
+	for {
+		current := atomic.LoadUint64(&e.nextOrderID)
+		if current >= minID {
+			break
+		}
+		if atomic.CompareAndSwapUint64(&e.nextOrderID, current, minID) {
+			break
+		}
 	}
 }
 

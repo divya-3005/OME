@@ -40,11 +40,9 @@ func (sim *MarketSimulator) SeedSymbol(symbol string) {
 		return
 	}
 
-	orderID := uint64(time.Now().UnixNano() % 10000000)
-
 	// Create 10 Bids below mid price
 	for i := 1; i <= 10; i++ {
-		orderID++
+		orderID := sim.eng.NextOrderID()
 		diff := uint64(i * 10)
 		qty := uint64(5 + rand.Intn(25))
 		order := &engine.Order{
@@ -61,7 +59,7 @@ func (sim *MarketSimulator) SeedSymbol(symbol string) {
 
 	// Create 10 Asks above mid price
 	for i := 1; i <= 10; i++ {
-		orderID++
+		orderID := sim.eng.NextOrderID()
 		diff := uint64(i * 10)
 		qty := uint64(5 + rand.Intn(25))
 		order := &engine.Order{
@@ -98,7 +96,6 @@ func (sim *MarketSimulator) Start() {
 	go func() {
 		ticker := time.NewTicker(600 * time.Millisecond)
 		defer ticker.Stop()
-		orderID := uint64(50000000)
 
 		symbols := []string{"AAPL", "TSLA", "BTC-USD"}
 
@@ -107,7 +104,7 @@ func (sim *MarketSimulator) Start() {
 			case <-sim.stop:
 				return
 			case <-ticker.C:
-				orderID++
+				orderID := sim.eng.NextOrderID()
 				symbol := symbols[rand.Intn(len(symbols))]
 				ob, exists := sim.eng.GetOrderBook(symbol)
 				if !exists {

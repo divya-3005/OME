@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -19,7 +22,27 @@ const (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for dev/testing
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // Non-browser clients (e.g. bots, CLI, automated tests)
+		}
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		// Allow same host or local development loopback
+		if u.Host == r.Host || u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" {
+			return true
+		}
+		// Allow custom origins configured in ALLOWED_ORIGINS env var
+		if allowed := os.Getenv("ALLOWED_ORIGINS"); allowed != "" {
+			for _, a := range strings.Split(allowed, ",") {
+				if strings.TrimSpace(a) == origin {
+					return true
+				}
+			}
+		}
+		return false
 	},
 }
 

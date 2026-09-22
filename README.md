@@ -49,29 +49,31 @@ graph TD
 ```
 
 ### 1. Sorted Price Levels with $O(\log P)$ Search & $O(1)$ FIFO Queues
-- **Price Levels**: Maintained in sorted order (bids descending, asks ascending) using binary search ($O(\log P)$) for level lookup and insertion.
+- **Price Levels**: Maintained in sorted order (bids descending, asks ascending) using binary search lookup ($O(\log P)$) with slice insertion shift ($O(P)$).
 - **Intrusive Doubly Linked Lists**: Orders at each price level form an intrusive FIFO queue:
   - **Add to queue**: Appended to tail in **$O(1)$**.
   - **Pop match**: Extracted from head in **$O(1)$**.
   - **Cancel order**: Unlinked directly in **$O(1)$** without array shifting or linear scans.
+- **Garbage-Collector Safe**: Pointer references are explicitly zeroed during level eviction, preventing backing-array memory retention.
 
-### 2. $O(1)$ Order Cancellations & Duplicate ID Protection
+### 2. $O(1)$ Order Cancellations & Unified ID Namespace
 - **Instant Cancellations**: An internal `Orders map[uint64]*Order` enables instant $O(1)$ lookup for order cancellation by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
-- **ID Uniqueness & Auto-Generation**: Order IDs are either generated monotonically server-side or verified for uniqueness before admission, preventing map overwrites and orphaned resting orders.
+- **Unified ID Namespace & Reconciliation**: Monotonic order ID generation is managed centrally by the engine (`eng.NextOrderID()`), reconciled post-WAL recovery (`SetMinOrderID`), and verified atomically to prevent map collisions and orphaned resting orders.
 
 ### 3. Fine-Grained Concurrency & Non-Blocking Hub
 - **Per-Symbol Synchronization**: Each `OrderBook` is protected by its own `sync.RWMutex`. This eliminates cross-symbol lock contention, allowing concurrent matching across distinct asset pairs (`AAPL`, `TSLA`, `BTC-USD`).
 - **TOCTOU-Free Order Ingestion**: Admission validation, WAL persistence, disk `fsync`, and in-memory matching execute atomically within the book lock, eliminating time-of-check-to-time-of-use races.
-- **Non-Blocking WebSocket Hub**: Implements dedicated per-client buffered channels (`send chan []byte`), write deadlines, and background `writePump` routines. A slow or wedged client cannot stall the broadcast event loop or block other traders.
+- **Non-Blocking WebSocket Hub**: Implements dedicated per-client buffered channels (`send chan []byte`), write deadlines, origin verification (safeguarding against cross-site hijacking), and background `writePump` routines. A slow or wedged client cannot stall the broadcast event loop or block other traders.
 
-### 4. Limit & Market Orders
+### 4. Limit & Market Orders with Explicit Execution Status
 - **Limit Orders**: Matches at or better than limit price; remaining volume rests on the book.
 - **Market Orders**: Sweeps available liquidity immediately across multiple price levels without resting.
+- **Transparent Execution Feedback**: API responses explicitly return `requested_amount`, `filled_amount`, `remaining_amount`, and execution status (`FILLED`, `PARTIALLY_FILLED`, `RESTING`, `UNFILLED`).
 
 ### 5. Durability via Write-Ahead Logging (WAL) & fsync
 - **Admission-Gated Logging**: Only pre-validated, admissible orders are logged to disk (`wal.log`), adhering to strict WAL discipline (unregistered symbols or duplicate payloads are rejected before dirtying the log).
 - **Physical Disk Durability**: Every committed placement and cancellation executes `wal.Sync()` (`fsync`), ensuring physical disk persistence against OS kernel crashes or sudden power loss before returning HTTP 200 OK.
-- **Crash Recovery**: On server startup or after an unexpected termination, the engine automatically replays the WAL to reconstruct the exact in-memory order book state, logging actionable warnings on any replay discrepancies.
+- **Self-Healing Crash Recovery**: On startup, `wal.Recover()` replays all valid historical events and automatically detects and truncates corrupt/partial trailing writes left by mid-write crashes, guaranteeing future writes remain durable and uncorrupted.
 
 ### 6. Institutional Trading Terminal (Web UI)
 - **Live L2 Order Book**: Real-time Bids (Green) and Asks (Red) with dynamic depth bars.

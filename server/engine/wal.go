@@ -2,7 +2,10 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -68,41 +71,70 @@ func (w *WAL) LogCancel(symbol string, orderID uint64) error {
 	return err
 }
 
-// Recover reads all entries from the log and replays them into the engine
-func (w *WAL) Recover(eng *Engine) error {
+// Recover reads all valid entries from the log, replays them into the engine,
+// and truncates any partially-written corrupt tail left from an unclean mid-write crash.
+func (w *WAL) Recover(eng *Engine) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if _, err := w.file.Seek(0, 0); err != nil {
-		return err
+		return 0, err
 	}
 
-	scanner := bufio.NewScanner(w.file)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	reader := bufio.NewReader(w.file)
+	var validOffset int64 = 0
+	var maxOrderID uint64 = 0
+
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			trimmed := bytes.TrimRight(line, "\r\n")
+			if len(trimmed) > 0 {
+				var entry WALEntry
+				if err := json.Unmarshal(trimmed, &entry); err != nil {
+					log.Printf("WAL recovery: detected corrupt/truncated entry at offset %d: %v. Truncating file tail to clean state.", validOffset, err)
+					break
+				}
+
+				switch entry.Action {
+				case "PLACE":
+					eng.RegisterSymbol(entry.Order.Symbol)
+					if entry.Order.ID > maxOrderID {
+						maxOrderID = entry.Order.ID
+					}
+					if _, err := eng.ProcessOrder(entry.Order); err != nil {
+						log.Printf("WAL recovery: warning replaying order %d: %v", entry.Order.ID, err)
+					}
+				case "CANCEL":
+					if entry.OrderID > maxOrderID {
+						maxOrderID = entry.OrderID
+					}
+					if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
+						log.Printf("WAL recovery: warning replaying cancel for order %d: %v", entry.OrderID, err)
+					}
+				}
+			}
+			validOffset += int64(len(line))
 		}
 
-		var entry WALEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			return err
-		}
-
-		switch entry.Action {
-		case "PLACE":
-			eng.RegisterSymbol(entry.Order.Symbol)
-			if _, err := eng.ProcessOrder(entry.Order); err != nil {
-				log.Printf("WAL recovery: warning replaying order %d: %v", entry.Order.ID, err)
+		if readErr != nil {
+			if readErr != io.EOF {
+				log.Printf("WAL recovery: error reading log: %v", readErr)
 			}
-		case "CANCEL":
-			if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
-				log.Printf("WAL recovery: warning replaying cancel for order %d: %v", entry.OrderID, err)
-			}
+			break
 		}
 	}
 
-	return scanner.Err()
+	// Truncate any corrupt/partial write at the tail so future appends start clean
+	if err := w.file.Truncate(validOffset); err != nil {
+		return maxOrderID, fmt.Errorf("failed to truncate corrupt WAL tail: %w", err)
+	}
+	if _, err := w.file.Seek(validOffset, 0); err != nil {
+		return maxOrderID, fmt.Errorf("failed to seek to clean WAL tail: %w", err)
+	}
+
+	eng.SetMinOrderID(maxOrderID + 1)
+	return maxOrderID, nil
 }
 
 // Sync commits the current contents of the WAL file to stable disk storage

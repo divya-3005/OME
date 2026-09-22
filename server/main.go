@@ -2,20 +2,20 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/divya-3005/OME/server/engine"
 )
 
-var nextOrderID uint64 = uint64(time.Now().UnixMilli())
-
 func main() {
 	// Initialize the engine and websocket hub
 	eng := engine.NewEngine()
+	eng.SetMinOrderID(uint64(time.Now().UnixMilli()))
+
 	hub := NewHub()
 	go hub.Run()
 
@@ -31,10 +31,10 @@ func main() {
 	}
 	defer wal.Close()
 
-	if err := wal.Recover(eng); err != nil {
+	if maxID, err := wal.Recover(eng); err != nil {
 		log.Printf("WAL recovery warning: %v", err)
 	} else {
-		log.Println("WAL recovery complete: restored previous order book state")
+		log.Printf("WAL recovery complete: restored state (highest order ID: %d)", maxID)
 	}
 
 	// Initialize Market Simulator & Seeder
@@ -113,18 +113,51 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 
 		// Auto-generate unique order ID if omitted or 0
 		if order.ID == 0 {
-			order.ID = atomic.AddUint64(&nextOrderID, 1)
+			order.ID = eng.NextOrderID()
 		}
 
 		if order.Timestamp == 0 {
 			order.Timestamp = time.Now().UnixNano()
 		}
 
-		// ProcessOrderWithWAL atomically validates admission, writes to WAL, calls wal.Sync(), and matches within book lock
+		// Validate Side and Type enum integrity
+		if order.Side != engine.Buy && order.Side != engine.Sell {
+			http.Error(w, fmt.Sprintf("invalid order side: %d (must be 0 for Buy or 1 for Sell)", order.Side), http.StatusBadRequest)
+			return
+		}
+		if order.Type != engine.Limit && order.Type != engine.Market {
+			http.Error(w, fmt.Sprintf("invalid order type: %d (must be 0 for Limit or 1 for Market)", order.Type), http.StatusBadRequest)
+			return
+		}
+
+		requestedAmount := order.Amount
 		trades, err := eng.ProcessOrderWithWAL(&order, wal)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+
+		var filledAmount uint64 = 0
+		for _, t := range trades {
+			filledAmount += t.Amount
+		}
+		remainingAmount := requestedAmount - filledAmount
+
+		status := "FILLED"
+		if remainingAmount > 0 {
+			if order.Type == engine.Market {
+				if filledAmount == 0 {
+					status = "UNFILLED"
+				} else {
+					status = "PARTIALLY_FILLED"
+				}
+			} else {
+				if filledAmount == 0 {
+					status = "RESTING"
+				} else {
+					status = "PARTIALLY_FILLED_RESTING"
+				}
+			}
 		}
 
 		if len(trades) > 0 {
@@ -137,8 +170,12 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"order":  order,
-			"trades": trades,
+			"order":            order,
+			"trades":           trades,
+			"requested_amount": requestedAmount,
+			"filled_amount":    filledAmount,
+			"remaining_amount": remainingAmount,
+			"status":           status,
 		})
 	}
 }

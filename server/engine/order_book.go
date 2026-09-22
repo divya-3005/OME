@@ -37,7 +37,7 @@ func NewOrderBook(symbol string) *OrderBook {
 	}
 }
 
-// getOrCreateBidLevel finds an existing Bid level or inserts a new one in descending order using binary search (O(log P))
+// getOrCreateBidLevel finds an existing Bid level or inserts a new one in descending order using binary search lookup (O(log P)) and slice insertion shift (O(P))
 func (ob *OrderBook) getOrCreateBidLevel(price uint64) *PriceLevel {
 	// Bids are sorted descending: level.Price <= price
 	idx := sort.Search(len(ob.Bids), func(i int) bool {
@@ -55,7 +55,7 @@ func (ob *OrderBook) getOrCreateBidLevel(price uint64) *PriceLevel {
 	return newLevel
 }
 
-// getOrCreateAskLevel finds an existing Ask level or inserts a new one in ascending order using binary search (O(log P))
+// getOrCreateAskLevel finds an existing Ask level or inserts a new one in ascending order using binary search lookup (O(log P)) and slice insertion shift (O(P))
 func (ob *OrderBook) getOrCreateAskLevel(price uint64) *PriceLevel {
 	// Asks are sorted ascending: level.Price >= price
 	idx := sort.Search(len(ob.Asks), func(i int) bool {
@@ -216,6 +216,12 @@ func (ob *OrderBook) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, erro
 	}
 	if _, exists := ob.Orders[order.ID]; exists {
 		return nil, fmt.Errorf("duplicate order ID: %d", order.ID)
+	}
+	if order.Side != Buy && order.Side != Sell {
+		return nil, fmt.Errorf("invalid order side: %d (must be 0 for Buy or 1 for Sell)", order.Side)
+	}
+	if order.Type != Limit && order.Type != Market {
+		return nil, fmt.Errorf("invalid order type: %d (must be 0 for Limit or 1 for Market)", order.Type)
 	}
 	if order.Amount == 0 {
 		return nil, fmt.Errorf("order amount must be greater than 0")
