@@ -11,27 +11,55 @@ import (
 )
 
 
-
 func main() {
-	// Initialize the engine
+	// Initialize the engine and websocket hub
 	eng := engine.NewEngine()
+	hub := NewHub()
+	go hub.Run()
 
 	// Pre-register supported symbols
 	eng.RegisterSymbol("AAPL")
 	eng.RegisterSymbol("TSLA")
 	eng.RegisterSymbol("BTC-USD")
 
-	// Set up REST endpoints (using Go 1.22+ pattern routing)
-	http.HandleFunc("POST /order", handlePlaceOrder(eng))
-	http.HandleFunc("DELETE /order", handleCancelOrder(eng))
+	// REST & WebSocket endpoints
+	http.HandleFunc("POST /order", handlePlaceOrder(eng, hub))
+	http.HandleFunc("DELETE /order", handleCancelOrder(eng, hub))
 	http.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
+	http.HandleFunc("/ws", handleWebSocket(hub))
 
 	log.Println("Order Matching Engine running on http://localhost:8080")
+	log.Println("WebSocket stream available at ws://localhost:8080/ws")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// handlePlaceOrder processes incoming POST /order requests
-func handlePlaceOrder(eng *engine.Engine) http.HandlerFunc {
+// handleWebSocket upgrades incoming HTTP connections to WebSocket
+func handleWebSocket(hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("failed to upgrade websocket: %v", err)
+			return
+		}
+
+		hub.register <- conn
+
+		// Keep connection alive until client disconnects
+		go func() {
+			defer func() {
+				hub.unregister <- conn
+			}()
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					break
+				}
+			}
+		}()
+	}
+}
+
+// handlePlaceOrder processes incoming POST /order requests and broadcasts trades
+func handlePlaceOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var order engine.Order
 		if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
@@ -49,6 +77,15 @@ func handlePlaceOrder(eng *engine.Engine) http.HandlerFunc {
 			return
 		}
 
+		// Broadcast executed trades via WebSocket
+		if len(trades) > 0 {
+			hub.BroadcastJSON(map[string]interface{}{
+				"type":   "trades",
+				"symbol": order.Symbol,
+				"data":   trades,
+			})
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"order":  order,
@@ -58,7 +95,7 @@ func handlePlaceOrder(eng *engine.Engine) http.HandlerFunc {
 }
 
 // handleCancelOrder processes DELETE /order?symbol=AAPL&id=1
-func handleCancelOrder(eng *engine.Engine) http.HandlerFunc {
+func handleCancelOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
 		idStr := r.URL.Query().Get("id")
@@ -73,6 +110,14 @@ func handleCancelOrder(eng *engine.Engine) http.HandlerFunc {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+
+		if success {
+			hub.BroadcastJSON(map[string]interface{}{
+				"type":     "order_cancelled",
+				"symbol":   symbol,
+				"order_id": orderID,
+			})
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -116,5 +161,3 @@ func handleGetOrderBook(eng *engine.Engine) http.HandlerFunc {
 		})
 	}
 }
-
-
