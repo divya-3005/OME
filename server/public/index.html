@@ -3,9 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OME // High-Frequency Order Matching Engine</title>
+  <title>OME // Institutional Order Matching Engine & Terminal</title>
   
-  <!-- Typography: Plus Jakarta Sans for UI, JetBrains Mono for Tabular Numerals -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -13,12 +12,12 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <!-- Top Navigation / Ticker Bar -->
+  <!-- Top Navigation & Telemetry Header -->
   <header class="terminal-header">
     <div class="header-left">
       <div class="logo">
         <span class="logo-badge">OME</span>
-        <span class="logo-title">ENGINE<span class="version-tag">v1.2</span></span>
+        <span class="logo-title">TERMINAL<span class="version-tag">v2.0</span></span>
       </div>
       <div class="symbol-tabs" id="symbolTabs">
         <button class="tab-btn active" data-symbol="AAPL">
@@ -31,25 +30,30 @@
         </button>
         <button class="tab-btn" data-symbol="BTC-USD">
           <span class="tab-symbol">BTC-USD</span>
-          <span class="tab-price" id="tabPrice-BTC-USD">$64,000</span>
+          <span class="tab-price" id="tabPrice-BTC-USD">$64,000.00</span>
         </button>
       </div>
     </div>
 
-    <!-- Engine Telemetry Bar -->
+    <!-- Simulator Control & Telemetry -->
     <div class="header-right">
+      <button class="btn-bot active" id="btnToggleBot" title="Toggle Background Market Simulator">
+        <span class="bot-dot"></span>
+        <span id="botLabel">BOT: ACTIVE</span>
+      </button>
+
+      <button class="btn-audio" id="btnToggleAudio" title="Toggle Trade Sound Chime">
+        🔊 AUDIO: ON
+      </button>
+
       <div class="telemetry-pill">
         <span class="dot green"></span>
-        <span class="telemetry-label">CORE LATENCY:</span>
+        <span class="telemetry-label">CORE:</span>
         <span class="telemetry-val">188 ns</span>
       </div>
       <div class="telemetry-pill">
-        <span class="telemetry-label">THROUGHPUT:</span>
-        <span class="telemetry-val">5.3M TPS</span>
-      </div>
-      <div class="telemetry-pill">
         <span class="telemetry-label">WAL:</span>
-        <span class="telemetry-val text-green">PERSISTED</span>
+        <span class="telemetry-val text-green">ACTIVE</span>
       </div>
       <div class="telemetry-pill" id="wsStatus">
         <span class="dot-pulse"></span>
@@ -57,6 +61,34 @@
       </div>
     </div>
   </header>
+
+  <!-- 24h Ticker Statistics Bar -->
+  <div class="ticker-bar">
+    <div class="ticker-item">
+      <span class="ticker-label">LAST PRICE</span>
+      <span class="ticker-val" id="tickerLastPrice">$150.00</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24H CHANGE</span>
+      <span class="ticker-val text-green" id="tickerChange">+1.45%</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24H HIGH</span>
+      <span class="ticker-val" id="tickerHigh">$152.80</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24H LOW</span>
+      <span class="ticker-val" id="tickerLow">$148.50</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">24H VOLUME</span>
+      <span class="ticker-val" id="tickerVolume">1,420,580</span>
+    </div>
+    <div class="ticker-item">
+      <span class="ticker-label">TOTAL TRADES</span>
+      <span class="ticker-val" id="tickerTradesCount">0</span>
+    </div>
+  </div>
 
   <!-- Main Trading Grid -->
   <main class="terminal-grid">
@@ -69,22 +101,19 @@
       </div>
 
       <div class="order-form">
-        <!-- Side Selector: Buy vs Sell -->
         <div class="segmented-control side-control">
           <button class="btn-side btn-buy active" id="btnSideBuy">BUY</button>
           <button class="btn-side btn-sell" id="btnSideSell">SELL</button>
         </div>
 
-        <!-- Type Selector: Limit vs Market -->
         <div class="segmented-control type-control">
           <button class="btn-type active" id="btnTypeLimit">LIMIT</button>
           <button class="btn-type" id="btnTypeMarket">MARKET</button>
         </div>
 
-        <!-- Input: Price -->
         <div class="input-group" id="priceGroup">
           <div class="input-label">
-            <span>PRICE</span>
+            <span>LIMIT PRICE</span>
             <span class="label-hint">Click book to set</span>
           </div>
           <div class="input-wrapper">
@@ -94,19 +123,17 @@
           </div>
         </div>
 
-        <!-- Input: Amount -->
         <div class="input-group">
           <div class="input-label">
-            <span>AMOUNT</span>
-            <span class="label-hint">Shares</span>
+            <span>QUANTITY</span>
+            <span class="label-hint">Units</span>
           </div>
           <div class="input-wrapper">
-            <input type="number" id="inputAmount" step="1" value="10" placeholder="Quantity">
+            <input type="number" id="inputAmount" step="1" value="10" placeholder="Amount">
             <span class="input-suffix">UNITS</span>
           </div>
         </div>
 
-        <!-- Quick Amount Shortcuts -->
         <div class="quick-amounts">
           <button class="quick-btn" data-qty="1">1</button>
           <button class="quick-btn" data-qty="5">5</button>
@@ -115,22 +142,20 @@
           <button class="quick-btn" data-qty="100">100</button>
         </div>
 
-        <!-- Order Total Preview -->
         <div class="order-summary">
           <span class="summary-label">Estimated Total:</span>
           <span class="summary-val" id="orderTotal">$1,500.00</span>
         </div>
 
-        <!-- Submit Button -->
         <button class="btn-submit btn-submit-buy" id="btnSubmitOrder">
-          SUBMIT BUY ORDER
+          SUBMIT LIMIT BUY ORDER
         </button>
       </div>
 
       <!-- Open / Resting Orders Table -->
       <div class="open-orders-section">
         <div class="subpanel-header">
-          <span>ACTIVE RESTING ORDERS</span>
+          <span>MY ACTIVE ORDERS</span>
           <span class="count-badge" id="openOrdersCount">0</span>
         </div>
         <div class="orders-table-wrapper">
@@ -152,11 +177,16 @@
       </div>
     </section>
 
-    <!-- CENTER: Live L2 Order Book -->
+    <!-- CENTER: Live L2 Order Book & Canvas Depth Chart -->
     <section class="panel order-book-panel">
       <div class="panel-header">
-        <span class="panel-title">ORDER BOOK (L2)</span>
+        <span class="panel-title">ORDER BOOK & MARKET DEPTH</span>
         <span class="depth-unit">DEPTH: 1000 HZ</span>
+      </div>
+
+      <!-- Real-Time Liquidity Depth Chart (Canvas) -->
+      <div class="depth-chart-wrapper">
+        <canvas id="depthChart" width="500" height="110"></canvas>
       </div>
 
       <div class="order-book-table-header">
@@ -165,7 +195,7 @@
         <span>TOTAL</span>
       </div>
 
-      <!-- Asks (Sells) descending -->
+      <!-- Asks (Sells) -->
       <div class="book-container asks-container" id="asksContainer">
         <div class="empty-state">Loading order book...</div>
       </div>
@@ -178,11 +208,11 @@
           <span class="spread-bps" id="spreadBps">(0.0 bps)</span>
         </div>
         <div class="spread-right" id="lastTradedPrice">
-          ---
+          $150.00
         </div>
       </div>
 
-      <!-- Bids (Buys) descending -->
+      <!-- Bids (Buys) -->
       <div class="book-container bids-container" id="bidsContainer">
         <div class="empty-state">Loading order book...</div>
       </div>

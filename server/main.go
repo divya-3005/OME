@@ -34,11 +34,36 @@ func main() {
 		log.Println("WAL recovery complete: restored previous order book state")
 	}
 
+	// Initialize Market Simulator & Seeder
+	sim := NewMarketSimulator(eng, hub, wal)
+
+	// If books are empty, seed them with realistic liquidity
+	if ob, exists := eng.GetOrderBook("AAPL"); exists && len(ob.Bids) == 0 {
+		log.Println("Seeding market with initial liquidity...")
+		sim.SeedMarket()
+	}
+
+	// Start live background bot simulation
+	sim.Start()
+	log.Println("Market Simulator active: simulating live institutional order flow")
+
 	// REST & WebSocket endpoints
 	http.HandleFunc("POST /order", handlePlaceOrder(eng, hub, wal))
 	http.HandleFunc("DELETE /order", handleCancelOrder(eng, hub, wal))
 	http.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
 	http.HandleFunc("/ws", handleWebSocket(hub))
+
+	// Simulator control endpoints
+	http.HandleFunc("POST /simulator/toggle", func(w http.ResponseWriter, r *http.Request) {
+		running := sim.Toggle()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"running": running})
+	})
+	http.HandleFunc("GET /simulator/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"running": sim.IsRunning()})
+	})
+
 	// Serve static frontend UI
 	http.Handle("/", http.FileServer(http.Dir("./public")))
 
@@ -84,7 +109,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			order.Timestamp = time.Now().UnixNano()
 		}
 
-		// Persist to WAL before or during processing
+		// Persist to WAL
 		if err := wal.LogPlace(&order); err != nil {
 			log.Printf("WAL log error: %v", err)
 		}
