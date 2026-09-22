@@ -55,8 +55,9 @@ graph TD
   - **Pop match**: Extracted from head in **$O(1)$**.
   - **Cancel order**: Unlinked directly in **$O(1)$** without array shifting or linear scans.
 
-### 2. $O(1)$ Order Cancellations via Hash Map
-- An internal `Orders map[uint64]*Order` enables instant $O(1)$ lookup for order cancellation by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
+### 2. $O(1)$ Order Cancellations & Duplicate ID Protection
+- **Instant Cancellations**: An internal `Orders map[uint64]*Order` enables instant $O(1)$ lookup for order cancellation by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
+- **ID Uniqueness & Auto-Generation**: Order IDs are either generated monotonically server-side or verified for uniqueness before admission, preventing map overwrites and orphaned resting orders.
 
 ### 3. Fine-Grained Concurrency & Race-Free Execution
 - **Per-Symbol Synchronization**: Each `OrderBook` is protected by its own `sync.RWMutex`. This eliminates cross-symbol lock contention, allowing concurrent matching across distinct asset pairs (`AAPL`, `TSLA`, `BTC-USD`).
@@ -67,8 +68,8 @@ graph TD
 - **Market Orders**: Sweeps available liquidity immediately across multiple price levels without resting.
 
 ### 5. Durability via Write-Ahead Logging (WAL)
-- Every order placement and cancellation is appended to disk (`wal.log`).
-- On server startup or after an unexpected termination, the engine automatically replays the WAL to reconstruct the exact in-memory order book state.
+- **Admission-Gated Logging**: Only pre-validated, admissible orders are logged to disk (`wal.log`), adhering to strict WAL discipline (unregistered symbols or invalid payloads are rejected before dirtying the log).
+- **Crash Recovery**: On server startup or after an unexpected termination, the engine automatically replays the WAL to reconstruct the exact in-memory order book state, logging actionable warnings on any replay discrepancies.
 - **Durability Note**: The WAL uses OS page-cache writes (`file.Write`) for sub-microsecond latency, protecting against application crashes and restarts. True physical disk durability across sudden power loss is supported via `wal.Sync()` (`fsync`), balancing write throughput against disk I/O latency.
 
 ### 6. Institutional Trading Terminal (Web UI)

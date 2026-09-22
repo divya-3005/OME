@@ -3,6 +3,7 @@ package engine
 import (
 	"bufio"
 	"encoding/json"
+	"log"
 	"os"
 	"sync"
 )
@@ -91,9 +92,13 @@ func (w *WAL) Recover(eng *Engine) error {
 		switch entry.Action {
 		case "PLACE":
 			eng.RegisterSymbol(entry.Order.Symbol)
-			eng.ProcessOrder(entry.Order)
+			if _, err := eng.ProcessOrder(entry.Order); err != nil {
+				log.Printf("WAL recovery: warning replaying order %d: %v", entry.Order.ID, err)
+			}
 		case "CANCEL":
-			eng.CancelOrder(entry.Symbol, entry.OrderID)
+			if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
+				log.Printf("WAL recovery: warning replaying cancel for order %d: %v", entry.OrderID, err)
+			}
 		}
 	}
 

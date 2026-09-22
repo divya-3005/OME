@@ -30,13 +30,19 @@ func TestFullMatch(t *testing.T) {
 	}
 
 	// Alice's order rests on the book (no trades yet)
-	trades1 := ob.ProcessOrder(aliceSell)
+	trades1, err := ob.ProcessOrder(aliceSell)
+	if err != nil {
+		t.Fatalf("unexpected error processing aliceSell: %v", err)
+	}
 	if len(trades1) != 0 {
 		t.Fatalf("expected 0 trades, got %d", len(trades1))
 	}
 
 	// Bob's order matches with Alice's
-	trades2 := ob.ProcessOrder(bobBuy)
+	trades2, err := ob.ProcessOrder(bobBuy)
+	if err != nil {
+		t.Fatalf("unexpected error processing bobBuy: %v", err)
+	}
 	if len(trades2) != 1 {
 		t.Fatalf("expected 1 trade, got %d", len(trades2))
 	}
@@ -59,12 +65,19 @@ func TestPartialFillAndFIFO(t *testing.T) {
 	ob := NewOrderBook("AAPL")
 
 	// Alice sells 10 @ $100
-	ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Sell, Price: 100, Amount: 10, Timestamp: 1})
+	if _, err := ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Sell, Price: 100, Amount: 10, Timestamp: 1}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	// Bob sells 10 @ $100 (arrived later)
-	ob.ProcessOrder(&Order{ID: 2, Symbol: "AAPL", Side: Sell, Price: 100, Amount: 10, Timestamp: 2})
+	if _, err := ob.ProcessOrder(&Order{ID: 2, Symbol: "AAPL", Side: Sell, Price: 100, Amount: 10, Timestamp: 2}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Charlie buys 15 @ $100
-	trades := ob.ProcessOrder(&Order{ID: 3, Symbol: "AAPL", Side: Buy, Price: 100, Amount: 15, Timestamp: 3})
+	trades, err := ob.ProcessOrder(&Order{ID: 3, Symbol: "AAPL", Side: Buy, Price: 100, Amount: 15, Timestamp: 3})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(trades) != 2 {
 		t.Fatalf("expected 2 trades, got %d", len(trades))
@@ -103,7 +116,9 @@ func TestCancelOrder(t *testing.T) {
 	}
 
 	// Place the order
-	ob.ProcessOrder(order)
+	if _, err := ob.ProcessOrder(order); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(ob.Orders) != 1 {
 		t.Fatalf("expected 1 order on book, got %d", len(ob.Orders))
 	}
@@ -128,12 +143,35 @@ func TestCancelOrder(t *testing.T) {
 	}
 }
 
+func TestDuplicateOrderID(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+
+	order1 := &Order{ID: 42, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10}
+	_, err := ob.ProcessOrder(order1)
+	if err != nil {
+		t.Fatalf("unexpected error on first order: %v", err)
+	}
+
+	// Attempting to place another order with the same ID must be rejected
+	order2 := &Order{ID: 42, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 105, Amount: 5}
+	_, err = ob.ProcessOrder(order2)
+	if err == nil {
+		t.Fatalf("expected error for duplicate order ID, got nil")
+	}
+
+	// Original resting order must remain intact and uncorrupted
+	resting, exists := ob.Orders[42]
+	if !exists || resting.Price != 100 || resting.Amount != 10 {
+		t.Fatalf("original order was corrupted or overwritten: %+v", resting)
+	}
+}
+
 func BenchmarkProcessOrder(b *testing.B) {
 	ob := NewOrderBook("AAPL")
 
 	// Pre-populate with 1,000 resting sell orders
 	for i := 0; i < 1000; i++ {
-		ob.ProcessOrder(&Order{
+		_, _ = ob.ProcessOrder(&Order{
 			ID:        uint64(i + 1),
 			Symbol:    "AAPL",
 			Side:      Sell,
@@ -146,7 +184,7 @@ func BenchmarkProcessOrder(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		ob.ProcessOrder(&Order{
+		_, _ = ob.ProcessOrder(&Order{
 			ID:        uint64(10000 + i),
 			Symbol:    "AAPL",
 			Side:      Buy,
@@ -161,9 +199,13 @@ func TestMarketOrder(t *testing.T) {
 	ob := NewOrderBook("AAPL")
 
 	// Alice sells 5 @ $100
-	ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 100, Amount: 5})
+	if _, err := ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 100, Amount: 5}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	// Bob sells 10 @ $105
-	ob.ProcessOrder(&Order{ID: 2, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 105, Amount: 10})
+	if _, err := ob.ProcessOrder(&Order{ID: 2, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 105, Amount: 10}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Charlie places a Market Buy for 12 shares
 	marketBuy := &Order{
@@ -174,7 +216,10 @@ func TestMarketOrder(t *testing.T) {
 		Amount: 12,
 	}
 
-	trades := ob.ProcessOrder(marketBuy)
+	trades, err := ob.ProcessOrder(marketBuy)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if len(trades) != 2 {
 		t.Fatalf("expected 2 trades, got %d", len(trades))
@@ -222,7 +267,7 @@ func TestConcurrentOrders(t *testing.T) {
 				price := uint64(100 + (i % 20))
 
 				// Submit Limit order
-				ob.ProcessOrder(&Order{
+				_, _ = ob.ProcessOrder(&Order{
 					ID:        orderID,
 					Symbol:    "AAPL",
 					Side:      side,
@@ -248,5 +293,3 @@ func TestConcurrentOrders(t *testing.T) {
 
 	wg.Wait()
 }
-
-

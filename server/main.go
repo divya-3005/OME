@@ -2,13 +2,17 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/divya-3005/OME/server/engine"
 )
+
+var nextOrderID uint64 = uint64(time.Now().UnixMilli())
 
 func main() {
 	// Initialize the engine and websocket hub
@@ -99,7 +103,7 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 	}
 }
 
-// handlePlaceOrder processes incoming POST /order requests, logs to WAL, and broadcasts trades
+// handlePlaceOrder processes incoming POST /order requests, validates input, logs to WAL, and broadcasts trades
 func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var order engine.Order
@@ -108,11 +112,39 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			return
 		}
 
+		// Auto-generate unique order ID if omitted or 0
+		if order.ID == 0 {
+			order.ID = atomic.AddUint64(&nextOrderID, 1)
+		}
+
 		if order.Timestamp == 0 {
 			order.Timestamp = time.Now().UnixNano()
 		}
 
-		// Persist to WAL
+		// Admission validation: verify symbol is registered
+		ob, exists := eng.GetOrderBook(order.Symbol)
+		if !exists {
+			http.Error(w, fmt.Sprintf("symbol %s not supported", order.Symbol), http.StatusBadRequest)
+			return
+		}
+
+		// Admission validation: reject duplicate order ID before dirtying the WAL
+		if ob.HasOrder(order.ID) {
+			http.Error(w, fmt.Sprintf("duplicate order ID: %d", order.ID), http.StatusBadRequest)
+			return
+		}
+
+		// Admission validation: sanity checks
+		if order.Amount == 0 {
+			http.Error(w, "order amount must be greater than 0", http.StatusBadRequest)
+			return
+		}
+		if order.Type == engine.Limit && order.Price == 0 {
+			http.Error(w, "limit order price must be greater than 0", http.StatusBadRequest)
+			return
+		}
+
+		// Persist to WAL only after passing admission validation
 		if err := wal.LogPlace(&order); err != nil {
 			log.Printf("WAL log error: %v", err)
 		}
@@ -151,7 +183,19 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 			return
 		}
 
-		// Log cancellation to WAL
+		ob, exists := eng.GetOrderBook(symbol)
+		if !exists {
+			http.Error(w, fmt.Sprintf("symbol %s not supported", symbol), http.StatusBadRequest)
+			return
+		}
+
+		// Validate order exists before dirtying the WAL
+		if !ob.HasOrder(orderID) {
+			http.Error(w, fmt.Sprintf("order ID %d not found for symbol %s", orderID, symbol), http.StatusNotFound)
+			return
+		}
+
+		// Log cancellation to WAL only after confirming order existence
 		if err := wal.LogCancel(symbol, orderID); err != nil {
 			log.Printf("WAL log error: %v", err)
 		}

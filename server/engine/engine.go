@@ -48,7 +48,7 @@ func (e *Engine) ProcessOrder(order *Order) ([]*Trade, error) {
 		return nil, fmt.Errorf("symbol %s not supported", order.Symbol)
 	}
 
-	return ob.ProcessOrder(order), nil
+	return ob.ProcessOrder(order)
 }
 
 // CancelOrder cancels an order for a given symbol

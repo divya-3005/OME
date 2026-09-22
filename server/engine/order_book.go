@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -190,15 +191,40 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 	return trades
 }
 
+// HasOrder checks if an order with the given ID is currently resting on the book
+func (ob *OrderBook) HasOrder(orderID uint64) bool {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+
+	_, exists := ob.Orders[orderID]
+	return exists
+}
+
 // ProcessOrder is the thread-safe entry point to submit an order
-func (ob *OrderBook) ProcessOrder(order *Order) []*Trade {
+func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	if order.Side == Buy {
-		return ob.matchBuyOrder(order)
+	if order == nil {
+		return nil, fmt.Errorf("order cannot be nil")
 	}
-	return ob.matchSellOrder(order)
+	if order.ID == 0 {
+		return nil, fmt.Errorf("order ID must be positive")
+	}
+	if _, exists := ob.Orders[order.ID]; exists {
+		return nil, fmt.Errorf("duplicate order ID: %d", order.ID)
+	}
+	if order.Amount == 0 {
+		return nil, fmt.Errorf("order amount must be greater than 0")
+	}
+	if order.Type == Limit && order.Price == 0 {
+		return nil, fmt.Errorf("limit order price must be greater than 0")
+	}
+
+	if order.Side == Buy {
+		return ob.matchBuyOrder(order), nil
+	}
+	return ob.matchSellOrder(order), nil
 }
 
 // CancelOrder is the thread-safe entry point to cancel an existing order by ID
