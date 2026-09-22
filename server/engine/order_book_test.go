@@ -157,3 +157,49 @@ func BenchmarkProcessOrder(b *testing.B) {
 		i++
 	}
 }
+
+func TestMarketOrder(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+
+	// Alice sells 5 @ $100
+	ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 100, Amount: 5})
+	// Bob sells 10 @ $105
+	ob.ProcessOrder(&Order{ID: 2, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 105, Amount: 10})
+
+	// Charlie places a Market Buy for 12 shares
+	marketBuy := &Order{
+		ID:     3,
+		Symbol: "AAPL",
+		Side:   Buy,
+		Type:   Market,
+		Amount: 12,
+	}
+
+	trades := ob.ProcessOrder(marketBuy)
+
+	if len(trades) != 2 {
+		t.Fatalf("expected 2 trades, got %d", len(trades))
+	}
+
+	// Trade 1: Alice (5 @ $100)
+	if trades[0].MakerOrderID != 1 || trades[0].Amount != 5 || trades[0].Price != 100 {
+		t.Errorf("trade 1 mismatch: got maker %d, amount %d, price %d", trades[0].MakerOrderID, trades[0].Amount, trades[0].Price)
+	}
+
+	// Trade 2: Bob (7 @ $105)
+	if trades[1].MakerOrderID != 2 || trades[1].Amount != 7 || trades[1].Price != 105 {
+		t.Errorf("trade 2 mismatch: got maker %d, amount %d, price %d", trades[1].MakerOrderID, trades[1].Amount, trades[1].Price)
+	}
+
+	// Bob should have 3 shares remaining on the book
+	remainingBob, exists := ob.Orders[2]
+	if !exists || remainingBob.Amount != 3 {
+		t.Errorf("expected Bob to have 3 shares remaining, got %v", remainingBob)
+	}
+
+	// Market order must NOT be on the book
+	if _, exists := ob.Orders[3]; exists {
+		t.Errorf("market order should not rest on the book")
+	}
+}
+

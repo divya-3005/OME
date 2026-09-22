@@ -10,7 +10,6 @@ import (
 	"github.com/divya-3005/OME/server/engine"
 )
 
-
 func main() {
 	// Initialize the engine and websocket hub
 	eng := engine.NewEngine()
@@ -22,9 +21,22 @@ func main() {
 	eng.RegisterSymbol("TSLA")
 	eng.RegisterSymbol("BTC-USD")
 
+	// Initialize Write-Ahead Log (WAL) and recover past state
+	wal, err := engine.OpenWAL("wal.log")
+	if err != nil {
+		log.Fatalf("failed to open WAL: %v", err)
+	}
+	defer wal.Close()
+
+	if err := wal.Recover(eng); err != nil {
+		log.Printf("WAL recovery warning: %v", err)
+	} else {
+		log.Println("WAL recovery complete: restored previous order book state")
+	}
+
 	// REST & WebSocket endpoints
-	http.HandleFunc("POST /order", handlePlaceOrder(eng, hub))
-	http.HandleFunc("DELETE /order", handleCancelOrder(eng, hub))
+	http.HandleFunc("POST /order", handlePlaceOrder(eng, hub, wal))
+	http.HandleFunc("DELETE /order", handleCancelOrder(eng, hub, wal))
 	http.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
 	http.HandleFunc("/ws", handleWebSocket(hub))
 
@@ -44,7 +56,6 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 
 		hub.register <- conn
 
-		// Keep connection alive until client disconnects
 		go func() {
 			defer func() {
 				hub.unregister <- conn
@@ -58,8 +69,8 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 	}
 }
 
-// handlePlaceOrder processes incoming POST /order requests and broadcasts trades
-func handlePlaceOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
+// handlePlaceOrder processes incoming POST /order requests, logs to WAL, and broadcasts trades
+func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var order engine.Order
 		if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
@@ -71,13 +82,17 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 			order.Timestamp = time.Now().UnixNano()
 		}
 
+		// Persist to WAL before or during processing
+		if err := wal.LogPlace(&order); err != nil {
+			log.Printf("WAL log error: %v", err)
+		}
+
 		trades, err := eng.ProcessOrder(&order)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		// Broadcast executed trades via WebSocket
 		if len(trades) > 0 {
 			hub.BroadcastJSON(map[string]interface{}{
 				"type":   "trades",
@@ -94,8 +109,8 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 	}
 }
 
-// handleCancelOrder processes DELETE /order?symbol=AAPL&id=1
-func handleCancelOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
+// handleCancelOrder processes DELETE /order?symbol=AAPL&id=1 and logs to WAL
+func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
 		idStr := r.URL.Query().Get("id")
@@ -104,6 +119,11 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 		if err != nil || symbol == "" {
 			http.Error(w, "query params 'symbol' and 'id' are required", http.StatusBadRequest)
 			return
+		}
+
+		// Log cancellation to WAL
+		if err := wal.LogCancel(symbol, orderID); err != nil {
+			log.Printf("WAL log error: %v", err)
 		}
 
 		success, err := eng.CancelOrder(symbol, orderID)

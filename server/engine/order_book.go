@@ -72,7 +72,7 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 		bestAsk := ob.Asks[0]
 
 		// If buyer's price is lower than the cheapest seller, no match
-		if order.Price < bestAsk.Price {
+		if order.Type == Limit && order.Price < bestAsk.Price {
 			break
 		}
 
@@ -116,7 +116,7 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 	}
 
 	// If the buy order is not completely filled, add remainder to Bids
-	if order.Amount > 0 {
+	if order.Type == Limit && order.Amount > 0  {
 		level := ob.getOrCreateBidLevel(order.Price)
 		level.AddOrder(order)
 		ob.Orders[order.ID] = order
@@ -133,7 +133,7 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 		bestBid := ob.Bids[0]
 
 		// If seller's price is higher than the best buyer offers, no match
-		if order.Price > bestBid.Price {
+		if order.Type == Limit && order.Price > bestBid.Price {
 			break
 		}
 
@@ -173,7 +173,7 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 	}
 
 	// If the sell order is not completely filled, add remainder to Asks
-	if order.Amount > 0 {
+	if order.Type == Limit && order.Amount > 0 {
 		level := ob.getOrCreateAskLevel(order.Price)
 		level.AddOrder(order)
 		ob.Orders[order.ID] = order
