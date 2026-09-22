@@ -1,0 +1,641 @@
+/* ==========================================================================
+   OME Institutional Trading Terminal Design System
+   ========================================================================== */
+
+:root {
+  --bg-void: #06080c;
+  --bg-panel: #0a0d14;
+  --bg-surface: #101420;
+  --bg-input: #080a0f;
+  
+  --border-subtle: #171d2b;
+  --border-muted: #21293d;
+  --border-active: #3a4766;
+
+  --text-primary: #f0f4fc;
+  --text-secondary: #8490a6;
+  --text-tertiary: #4a5568;
+
+  --green: #00f090;
+  --green-hover: #00d680;
+  --green-bg: rgba(0, 240, 144, 0.08);
+  --green-bar: rgba(0, 240, 144, 0.15);
+
+  --red: #ff3358;
+  --red-hover: #e62044;
+  --red-bg: rgba(255, 51, 88, 0.08);
+  --red-bar: rgba(255, 51, 88, 0.15);
+
+  --accent-blue: #2f81f7;
+
+  --font-ui: 'Plus Jakarta Sans', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background-color: var(--bg-void);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --------------------------------------------------------------------------
+   Top Navigation & Telemetry Header
+   -------------------------------------------------------------------------- */
+.terminal-header {
+  height: 52px;
+  background-color: var(--bg-panel);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  user-select: none;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.logo-badge {
+  background: linear-gradient(135deg, #2f81f7, #00f090);
+  color: #000;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 11px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+}
+
+.logo-title {
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--text-primary);
+}
+
+.version-tag {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  margin-left: 4px;
+}
+
+.symbol-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.tab-btn {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transition: all 0.15s ease;
+}
+
+.tab-btn:hover {
+  background: var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.tab-btn.active {
+  background: var(--border-muted);
+  border-color: var(--accent-blue);
+  color: var(--text-primary);
+}
+
+.tab-price {
+  font-weight: 600;
+  color: var(--green);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.telemetry-pill {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.telemetry-label {
+  color: var(--text-tertiary);
+}
+
+.telemetry-val {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.text-green {
+  color: var(--green);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.dot.green {
+  background-color: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+
+.dot-pulse {
+  width: 6px;
+  height: 6px;
+  background-color: var(--green);
+  border-radius: 50%;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 240, 144, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(0, 240, 144, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 240, 144, 0); }
+}
+
+/* --------------------------------------------------------------------------
+   Grid Layout: Left (Entry), Center (Order Book), Right (Trades)
+   -------------------------------------------------------------------------- */
+.terminal-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 320px 1fr 300px;
+  gap: 1px;
+  background-color: var(--border-subtle);
+  overflow: hidden;
+}
+
+.panel {
+  background-color: var(--bg-panel);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-header {
+  height: 38px;
+  background-color: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.active-symbol-tag, .depth-unit, .live-dot-container {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+/* --------------------------------------------------------------------------
+   Order Entry Panel (Left)
+   -------------------------------------------------------------------------- */
+.order-form {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  background-color: var(--bg-void);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.segmented-control button {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 11px;
+  padding: 7px 0;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.side-control .btn-buy.active {
+  background-color: var(--green);
+  color: #000;
+}
+
+.side-control .btn-sell.active {
+  background-color: var(--red);
+  color: #fff;
+}
+
+.type-control button.active {
+  background-color: var(--border-muted);
+  color: var(--text-primary);
+}
+
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.input-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.label-hint {
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+.input-wrapper {
+  display: flex;
+  align-items: center;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  padding: 0 10px;
+  transition: border-color 0.15s;
+}
+
+.input-wrapper:focus-within {
+  border-color: var(--accent-blue);
+}
+
+.input-prefix, .input-suffix {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+.input-wrapper input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 9px 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.quick-amounts {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+
+.quick-btn {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  padding: 4px 0;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.quick-btn:hover {
+  background: var(--border-muted);
+  color: var(--text-primary);
+}
+
+.order-summary {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 4px 0;
+}
+
+.summary-label {
+  color: var(--text-tertiary);
+}
+
+.summary-val {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.btn-submit {
+  width: 100%;
+  padding: 11px;
+  border: none;
+  border-radius: 6px;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.05s;
+}
+
+.btn-submit:active {
+  transform: scale(0.99);
+}
+
+.btn-submit-buy {
+  background-color: var(--green);
+  color: #000;
+}
+
+.btn-submit-sell {
+  background-color: var(--red);
+  color: #fff;
+}
+
+/* Open Orders Subpanel */
+.open-orders-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.subpanel-header {
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--text-secondary);
+}
+
+.count-badge {
+  background: var(--border-muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  color: var(--text-primary);
+}
+
+.orders-table-wrapper {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.data-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+  color: var(--text-tertiary);
+  font-weight: 500;
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 10px;
+}
+
+.data-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.btn-cancel {
+  background: transparent;
+  border: 1px solid var(--border-muted);
+  color: var(--red);
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.btn-cancel:hover {
+  background: var(--red-bg);
+  border-color: var(--red);
+}
+
+.empty-row td {
+  text-align: center;
+  color: var(--text-tertiary);
+  padding: 24px 0;
+}
+
+/* --------------------------------------------------------------------------
+   Order Book Panel (Center)
+   -------------------------------------------------------------------------- */
+.order-book-table-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: 7px 14px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-subtle);
+  user-select: none;
+}
+
+.order-book-table-header span:nth-child(2),
+.order-book-table-header span:nth-child(3) {
+  text-align: right;
+}
+
+.book-container {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.asks-container {
+  justify-content: flex-end; /* Best ask sits at the bottom next to spread */
+}
+
+.book-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: 4px 14px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+}
+
+.book-row:hover {
+  background-color: var(--border-subtle) !important;
+}
+
+.book-row span:nth-child(2),
+.book-row span:nth-child(3) {
+  text-align: right;
+ }
+.book-depth-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  pointer-events: none;
+  transition: width 0.2s ease-out;
+}
+.ask-row .book-price {
+  color: var(--red);
+}
+.ask-row .book-depth-bar {
+  background: var(--red-bar);
+}
+.bid-row .book-price {
+  color: var(--green);
+}
+.bid-row .book-depth-bar {
+  background: var(--green-bar);
+}
+/* Spread Indicator */
+.spread-indicator {
+  height: 36px;
+  background: var(--bg-void);
+  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.spread-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.spread-label {
+  color: var(--text-tertiary);
+}
+.spread-value {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.spread-bps {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+.spread-right {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--green);
+}
+/* --------------------------------------------------------------------------
+   Recent Trades Stream (Right)
+   -------------------------------------------------------------------------- */
+.trades-table-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: 7px 14px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.trades-table-header span:nth-child(2),
+.trades-table-header span:nth-child(3) {
+  text-align: right;
+}
+.trades-stream {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.trade-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  padding: 5px 14px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  animation: flashIn 0.3s ease-out;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+}
+@keyframes flashIn {
+  from { background-color: rgba(255, 255, 255, 0.1); }
+  to { background-color: transparent; }
+}
+.trade-row span:nth-child(2) {
+  text-align: right;
+  color: var(--text-secondary);
+}
+.trade-row span:nth-child(3) {
+  text-align: right;
+  color: var(--text-tertiary);
+}
+.trade-price.buy {
+  color: var(--green);
+}
+.trade-price.sell {
+  color: var(--red);
+}
+.empty-state {
+  padding: 30px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}

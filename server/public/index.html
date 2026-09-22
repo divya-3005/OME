@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OME // High-Frequency Order Matching Engine</title>
+  
+  <!-- Typography: Plus Jakarta Sans for UI, JetBrains Mono for Tabular Numerals -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Top Navigation / Ticker Bar -->
+  <header class="terminal-header">
+    <div class="header-left">
+      <div class="logo">
+        <span class="logo-badge">OME</span>
+        <span class="logo-title">ENGINE<span class="version-tag">v1.2</span></span>
+      </div>
+      <div class="symbol-tabs" id="symbolTabs">
+        <button class="tab-btn active" data-symbol="AAPL">
+          <span class="tab-symbol">AAPL</span>
+          <span class="tab-price" id="tabPrice-AAPL">$150.00</span>
+        </button>
+        <button class="tab-btn" data-symbol="TSLA">
+          <span class="tab-symbol">TSLA</span>
+          <span class="tab-price" id="tabPrice-TSLA">$240.00</span>
+        </button>
+        <button class="tab-btn" data-symbol="BTC-USD">
+          <span class="tab-symbol">BTC-USD</span>
+          <span class="tab-price" id="tabPrice-BTC-USD">$64,000</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Engine Telemetry Bar -->
+    <div class="header-right">
+      <div class="telemetry-pill">
+        <span class="dot green"></span>
+        <span class="telemetry-label">CORE LATENCY:</span>
+        <span class="telemetry-val">188 ns</span>
+      </div>
+      <div class="telemetry-pill">
+        <span class="telemetry-label">THROUGHPUT:</span>
+        <span class="telemetry-val">5.3M TPS</span>
+      </div>
+      <div class="telemetry-pill">
+        <span class="telemetry-label">WAL:</span>
+        <span class="telemetry-val text-green">PERSISTED</span>
+      </div>
+      <div class="telemetry-pill" id="wsStatus">
+        <span class="dot-pulse"></span>
+        <span class="telemetry-val">WS LIVE</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Trading Grid -->
+  <main class="terminal-grid">
+    
+    <!-- LEFT: Order Entry & Open Orders -->
+    <section class="panel order-entry-panel">
+      <div class="panel-header">
+        <span class="panel-title">ORDER ENTRY</span>
+        <span class="active-symbol-tag" id="activeSymbolTag">AAPL</span>
+      </div>
+
+      <div class="order-form">
+        <!-- Side Selector: Buy vs Sell -->
+        <div class="segmented-control side-control">
+          <button class="btn-side btn-buy active" id="btnSideBuy">BUY</button>
+          <button class="btn-side btn-sell" id="btnSideSell">SELL</button>
+        </div>
+
+        <!-- Type Selector: Limit vs Market -->
+        <div class="segmented-control type-control">
+          <button class="btn-type active" id="btnTypeLimit">LIMIT</button>
+          <button class="btn-type" id="btnTypeMarket">MARKET</button>
+        </div>
+
+        <!-- Input: Price -->
+        <div class="input-group" id="priceGroup">
+          <div class="input-label">
+            <span>PRICE</span>
+            <span class="label-hint">Click book to set</span>
+          </div>
+          <div class="input-wrapper">
+            <span class="input-prefix">$</span>
+            <input type="number" id="inputPrice" step="0.01" value="150.00" placeholder="0.00">
+            <span class="input-suffix">USD</span>
+          </div>
+        </div>
+
+        <!-- Input: Amount -->
+        <div class="input-group">
+          <div class="input-label">
+            <span>AMOUNT</span>
+            <span class="label-hint">Shares</span>
+          </div>
+          <div class="input-wrapper">
+            <input type="number" id="inputAmount" step="1" value="10" placeholder="Quantity">
+            <span class="input-suffix">UNITS</span>
+          </div>
+        </div>
+
+        <!-- Quick Amount Shortcuts -->
+        <div class="quick-amounts">
+          <button class="quick-btn" data-qty="1">1</button>
+          <button class="quick-btn" data-qty="5">5</button>
+          <button class="quick-btn" data-qty="10">10</button>
+          <button class="quick-btn" data-qty="50">50</button>
+          <button class="quick-btn" data-qty="100">100</button>
+        </div>
+
+        <!-- Order Total Preview -->
+        <div class="order-summary">
+          <span class="summary-label">Estimated Total:</span>
+          <span class="summary-val" id="orderTotal">$1,500.00</span>
+        </div>
+
+        <!-- Submit Button -->
+        <button class="btn-submit btn-submit-buy" id="btnSubmitOrder">
+          SUBMIT BUY ORDER
+        </button>
+      </div>
+
+      <!-- Open / Resting Orders Table -->
+      <div class="open-orders-section">
+        <div class="subpanel-header">
+          <span>ACTIVE RESTING ORDERS</span>
+          <span class="count-badge" id="openOrdersCount">0</span>
+        </div>
+        <div class="orders-table-wrapper">
+          <table class="data-table" id="ordersTable">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>SIDE</th>
+                <th>PRICE</th>
+                <th>REMAINING</th>
+                <th>ACTION</th>
+              </tr>
+            </thead>
+            <tbody id="ordersTableBody">
+              <tr class="empty-row"><td colspan="5">No active resting orders</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- CENTER: Live L2 Order Book -->
+    <section class="panel order-book-panel">
+      <div class="panel-header">
+        <span class="panel-title">ORDER BOOK (L2)</span>
+        <span class="depth-unit">DEPTH: 1000 HZ</span>
+      </div>
+
+      <div class="order-book-table-header">
+        <span>PRICE (USD)</span>
+        <span>SIZE</span>
+        <span>TOTAL</span>
+      </div>
+
+      <!-- Asks (Sells) descending -->
+      <div class="book-container asks-container" id="asksContainer">
+        <div class="empty-state">Loading order book...</div>
+      </div>
+
+      <!-- Mid-Market Spread Indicator -->
+      <div class="spread-indicator">
+        <div class="spread-left">
+          <span class="spread-label">SPREAD:</span>
+          <span class="spread-value" id="spreadValue">$0.00</span>
+          <span class="spread-bps" id="spreadBps">(0.0 bps)</span>
+        </div>
+        <div class="spread-right" id="lastTradedPrice">
+          ---
+        </div>
+      </div>
+
+      <!-- Bids (Buys) descending -->
+      <div class="book-container bids-container" id="bidsContainer">
+        <div class="empty-state">Loading order book...</div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Real-Time Trade Stream -->
+    <section class="panel trades-panel">
+      <div class="panel-header">
+        <span class="panel-title">RECENT TRADES</span>
+        <span class="live-dot-container"><span class="dot green"></span> LIVE STREAM</span>
+      </div>
+
+      <div class="trades-table-header">
+        <span>PRICE (USD)</span>
+        <span>SIZE</span>
+        <span>TIME</span>
+      </div>
+
+      <div class="trades-stream" id="tradesStream">
+        <div class="empty-state">Waiting for executions...</div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

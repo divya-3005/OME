@@ -39,6 +39,8 @@ func main() {
 	http.HandleFunc("DELETE /order", handleCancelOrder(eng, hub, wal))
 	http.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
 	http.HandleFunc("/ws", handleWebSocket(hub))
+	// Serve static frontend UI
+	http.Handle("/", http.FileServer(http.Dir("./public")))
 
 	log.Println("Order Matching Engine running on http://localhost:8080")
 	log.Println("WebSocket stream available at ws://localhost:8080/ws")
