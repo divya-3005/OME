@@ -144,8 +144,7 @@ func BenchmarkProcessOrder(b *testing.B) {
 
 	b.ResetTimer()
 
-	i := 0
-	for b.Loop() {
+	for i := 0; i < b.N; i++ {
 		ob.ProcessOrder(&Order{
 			ID:        uint64(10000 + i),
 			Symbol:    "AAPL",
@@ -154,7 +153,6 @@ func BenchmarkProcessOrder(b *testing.B) {
 			Amount:    1,
 			Timestamp: int64(i),
 		})
-		i++
 	}
 }
 
