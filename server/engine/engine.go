@@ -41,23 +41,36 @@ func (e *Engine) GetOrderBook(symbol string) (*OrderBook, bool) {
 	return ob, exists
 }
 
-// ProcessOrder routes an incoming order to its respective OrderBook
-func (e *Engine) ProcessOrder(order *Order) ([]*Trade, error) {
+// ProcessOrderWithWAL routes an incoming order to its respective OrderBook with atomic WAL logging & fsync
+func (e *Engine) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
+	if order == nil {
+		return nil, fmt.Errorf("order cannot be nil")
+	}
+
 	ob, exists := e.GetOrderBook(order.Symbol)
 	if !exists {
 		return nil, fmt.Errorf("symbol %s not supported", order.Symbol)
 	}
 
-	return ob.ProcessOrder(order)
+	return ob.ProcessOrderWithWAL(order, wal)
 }
 
-// CancelOrder cancels an order for a given symbol
-func (e *Engine) CancelOrder(symbol string, orderID uint64) (bool, error) {
+// ProcessOrder routes an incoming order to its respective OrderBook without WAL
+func (e *Engine) ProcessOrder(order *Order) ([]*Trade, error) {
+	return e.ProcessOrderWithWAL(order, nil)
+}
+
+// CancelOrderWithWAL cancels an order for a given symbol with atomic WAL logging & fsync
+func (e *Engine) CancelOrderWithWAL(symbol string, orderID uint64, wal *WAL) (bool, error) {
 	ob, exists := e.GetOrderBook(symbol)
 	if !exists {
 		return false, fmt.Errorf("symbol %s not supported", symbol)
 	}
 
-	return ob.CancelOrder(orderID), nil
+	return ob.CancelOrderWithWAL(orderID, wal)
 }
 
+// CancelOrder cancels an order for a given symbol without WAL
+func (e *Engine) CancelOrder(symbol string, orderID uint64) (bool, error) {
+	return e.CancelOrderWithWAL(symbol, orderID, nil)
+}

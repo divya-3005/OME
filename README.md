@@ -59,18 +59,19 @@ graph TD
 - **Instant Cancellations**: An internal `Orders map[uint64]*Order` enables instant $O(1)$ lookup for order cancellation by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
 - **ID Uniqueness & Auto-Generation**: Order IDs are either generated monotonically server-side or verified for uniqueness before admission, preventing map overwrites and orphaned resting orders.
 
-### 3. Fine-Grained Concurrency & Race-Free Execution
+### 3. Fine-Grained Concurrency & Non-Blocking Hub
 - **Per-Symbol Synchronization**: Each `OrderBook` is protected by its own `sync.RWMutex`. This eliminates cross-symbol lock contention, allowing concurrent matching across distinct asset pairs (`AAPL`, `TSLA`, `BTC-USD`).
-- **Thread-Safe Architecture**: Safely coordinates simultaneous order submissions from HTTP handlers, background market maker bots, and real-time WebSocket market data reads (verified with `go test -v -race`).
+- **TOCTOU-Free Order Ingestion**: Admission validation, WAL persistence, disk `fsync`, and in-memory matching execute atomically within the book lock, eliminating time-of-check-to-time-of-use races.
+- **Non-Blocking WebSocket Hub**: Implements dedicated per-client buffered channels (`send chan []byte`), write deadlines, and background `writePump` routines. A slow or wedged client cannot stall the broadcast event loop or block other traders.
 
 ### 4. Limit & Market Orders
 - **Limit Orders**: Matches at or better than limit price; remaining volume rests on the book.
 - **Market Orders**: Sweeps available liquidity immediately across multiple price levels without resting.
 
-### 5. Durability via Write-Ahead Logging (WAL)
-- **Admission-Gated Logging**: Only pre-validated, admissible orders are logged to disk (`wal.log`), adhering to strict WAL discipline (unregistered symbols or invalid payloads are rejected before dirtying the log).
+### 5. Durability via Write-Ahead Logging (WAL) & fsync
+- **Admission-Gated Logging**: Only pre-validated, admissible orders are logged to disk (`wal.log`), adhering to strict WAL discipline (unregistered symbols or duplicate payloads are rejected before dirtying the log).
+- **Physical Disk Durability**: Every committed placement and cancellation executes `wal.Sync()` (`fsync`), ensuring physical disk persistence against OS kernel crashes or sudden power loss before returning HTTP 200 OK.
 - **Crash Recovery**: On server startup or after an unexpected termination, the engine automatically replays the WAL to reconstruct the exact in-memory order book state, logging actionable warnings on any replay discrepancies.
-- **Durability Note**: The WAL uses OS page-cache writes (`file.Write`) for sub-microsecond latency, protecting against application crashes and restarts. True physical disk durability across sudden power loss is supported via `wal.Sync()` (`fsync`), balancing write throughput against disk I/O latency.
 
 ### 6. Institutional Trading Terminal (Web UI)
 - **Live L2 Order Book**: Real-time Bids (Green) and Asks (Red) with dynamic depth bars.

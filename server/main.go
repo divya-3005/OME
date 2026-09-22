@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -41,12 +40,15 @@ func main() {
 	// Initialize Market Simulator & Seeder
 	sim := NewMarketSimulator(eng, hub, wal)
 
-	// If books are empty, seed them with realistic liquidity
-	if ob, exists := eng.GetOrderBook("AAPL"); exists {
-		bids, _ := ob.GetSnapshot()
-		if len(bids) == 0 {
-			log.Println("Seeding market with initial liquidity...")
-			sim.SeedMarket()
+	// Seed each symbol individually if its order book is empty
+	symbols := []string{"AAPL", "TSLA", "BTC-USD"}
+	for _, sym := range symbols {
+		if ob, exists := eng.GetOrderBook(sym); exists {
+			bids, _ := ob.GetSnapshot()
+			if len(bids) == 0 {
+				log.Printf("Seeding market with initial liquidity for %s...", sym)
+				sim.SeedSymbol(sym)
+			}
 		}
 	}
 
@@ -79,7 +81,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// handleWebSocket upgrades incoming HTTP connections to WebSocket
+// handleWebSocket upgrades incoming HTTP connections to WebSocket and registers a non-blocking Client
 func handleWebSocket(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -88,22 +90,19 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 			return
 		}
 
-		hub.register <- conn
+		client := &Client{
+			hub:  hub,
+			conn: conn,
+			send: make(chan []byte, sendBufferSize),
+		}
+		hub.register <- client
 
-		go func() {
-			defer func() {
-				hub.unregister <- conn
-			}()
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					break
-				}
-			}
-		}()
+		go client.writePump()
+		go client.readPump()
 	}
 }
 
-// handlePlaceOrder processes incoming POST /order requests, validates input, logs to WAL, and broadcasts trades
+// handlePlaceOrder processes incoming POST /order requests with atomic WAL logging & fsync (eliminates TOCTOU)
 func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var order engine.Order
@@ -121,35 +120,8 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			order.Timestamp = time.Now().UnixNano()
 		}
 
-		// Admission validation: verify symbol is registered
-		ob, exists := eng.GetOrderBook(order.Symbol)
-		if !exists {
-			http.Error(w, fmt.Sprintf("symbol %s not supported", order.Symbol), http.StatusBadRequest)
-			return
-		}
-
-		// Admission validation: reject duplicate order ID before dirtying the WAL
-		if ob.HasOrder(order.ID) {
-			http.Error(w, fmt.Sprintf("duplicate order ID: %d", order.ID), http.StatusBadRequest)
-			return
-		}
-
-		// Admission validation: sanity checks
-		if order.Amount == 0 {
-			http.Error(w, "order amount must be greater than 0", http.StatusBadRequest)
-			return
-		}
-		if order.Type == engine.Limit && order.Price == 0 {
-			http.Error(w, "limit order price must be greater than 0", http.StatusBadRequest)
-			return
-		}
-
-		// Persist to WAL only after passing admission validation
-		if err := wal.LogPlace(&order); err != nil {
-			log.Printf("WAL log error: %v", err)
-		}
-
-		trades, err := eng.ProcessOrder(&order)
+		// ProcessOrderWithWAL atomically validates admission, writes to WAL, calls wal.Sync(), and matches within book lock
+		trades, err := eng.ProcessOrderWithWAL(&order, wal)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -171,7 +143,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 	}
 }
 
-// handleCancelOrder processes DELETE /order?symbol=AAPL&id=1 and logs to WAL
+// handleCancelOrder processes DELETE /order?symbol=AAPL&id=1 with atomic WAL logging & fsync
 func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
@@ -183,26 +155,10 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 			return
 		}
 
-		ob, exists := eng.GetOrderBook(symbol)
-		if !exists {
-			http.Error(w, fmt.Sprintf("symbol %s not supported", symbol), http.StatusBadRequest)
-			return
-		}
-
-		// Validate order exists before dirtying the WAL
-		if !ob.HasOrder(orderID) {
-			http.Error(w, fmt.Sprintf("order ID %d not found for symbol %s", orderID, symbol), http.StatusNotFound)
-			return
-		}
-
-		// Log cancellation to WAL only after confirming order existence
-		if err := wal.LogCancel(symbol, orderID); err != nil {
-			log.Printf("WAL log error: %v", err)
-		}
-
-		success, err := eng.CancelOrder(symbol, orderID)
+		// CancelOrderWithWAL atomically checks order existence, writes to WAL, calls wal.Sync(), and removes within book lock
+		success, err := eng.CancelOrderWithWAL(symbol, orderID, wal)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
 

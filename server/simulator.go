@@ -26,55 +26,61 @@ func NewMarketSimulator(eng *engine.Engine, hub *Hub, wal *engine.WAL) *MarketSi
 	}
 }
 
-// SeedMarket pre-populates realistic bids and asks for all symbols
-func (sim *MarketSimulator) SeedMarket() {
-	symbols := []struct {
-		name     string
-		midPrice uint64 // in cents
-	}{
-		{"AAPL", 15000},     // $150.00
-		{"TSLA", 24000},     // $240.00
-		{"BTC-USD", 6400000}, // $64,000.00
+// SeedSymbol pre-populates realistic bids and asks for a single symbol
+func (sim *MarketSimulator) SeedSymbol(symbol string) {
+	var midPrice uint64
+	switch symbol {
+	case "AAPL":
+		midPrice = 15000 // $150.00
+	case "TSLA":
+		midPrice = 24000 // $240.00
+	case "BTC-USD":
+		midPrice = 6400000 // $64,000.00
+	default:
+		return
 	}
 
-	orderID := uint64(1000)
+	orderID := uint64(time.Now().UnixNano() % 10000000)
 
-	for _, s := range symbols {
-		// Create 10 Bids below mid price
-		for i := 1; i <= 10; i++ {
-			orderID++
-			diff := uint64(i * 10)
-			qty := uint64(5 + rand.Intn(25))
-			order := &engine.Order{
-				ID:        orderID,
-				Symbol:    s.name,
-				Side:      engine.Buy,
-				Type:      engine.Limit,
-				Price:     s.midPrice - diff,
-				Amount:    qty,
-				Timestamp: time.Now().UnixNano(),
-			}
-			sim.wal.LogPlace(order)
-			sim.eng.ProcessOrder(order)
+	// Create 10 Bids below mid price
+	for i := 1; i <= 10; i++ {
+		orderID++
+		diff := uint64(i * 10)
+		qty := uint64(5 + rand.Intn(25))
+		order := &engine.Order{
+			ID:        orderID,
+			Symbol:    symbol,
+			Side:      engine.Buy,
+			Type:      engine.Limit,
+			Price:     midPrice - diff,
+			Amount:    qty,
+			Timestamp: time.Now().UnixNano(),
 		}
+		sim.eng.ProcessOrderWithWAL(order, sim.wal)
+	}
 
-		// Create 10 Asks above mid price
-		for i := 1; i <= 10; i++ {
-			orderID++
-			diff := uint64(i * 10)
-			qty := uint64(5 + rand.Intn(25))
-			order := &engine.Order{
-				ID:        orderID,
-				Symbol:    s.name,
-				Side:      engine.Sell,
-				Type:      engine.Limit,
-				Price:     s.midPrice + diff,
-				Amount:    qty,
-				Timestamp: time.Now().UnixNano(),
-			}
-			sim.wal.LogPlace(order)
-			sim.eng.ProcessOrder(order)
+	// Create 10 Asks above mid price
+	for i := 1; i <= 10; i++ {
+		orderID++
+		diff := uint64(i * 10)
+		qty := uint64(5 + rand.Intn(25))
+		order := &engine.Order{
+			ID:        orderID,
+			Symbol:    symbol,
+			Side:      engine.Sell,
+			Type:      engine.Limit,
+			Price:     midPrice + diff,
+			Amount:    qty,
+			Timestamp: time.Now().UnixNano(),
 		}
+		sim.eng.ProcessOrderWithWAL(order, sim.wal)
+	}
+}
+
+// SeedMarket pre-populates realistic bids and asks for all symbols
+func (sim *MarketSimulator) SeedMarket() {
+	for _, sym := range []string{"AAPL", "TSLA", "BTC-USD"} {
+		sim.SeedSymbol(sym)
 	}
 }
 
@@ -92,7 +98,7 @@ func (sim *MarketSimulator) Start() {
 	go func() {
 		ticker := time.NewTicker(600 * time.Millisecond)
 		defer ticker.Stop()
-		orderID := uint64(50000)
+		orderID := uint64(50000000)
 
 		symbols := []string{"AAPL", "TSLA", "BTC-USD"}
 
@@ -124,7 +130,12 @@ func (sim *MarketSimulator) Start() {
 					if isMarket || rand.Float32() < 0.4 {
 						price = bestAsk
 					} else {
-						price = bestBid - uint64(rand.Intn(30))
+						offset := uint64(rand.Intn(30))
+						if bestBid > offset {
+							price = bestBid - offset
+						} else {
+							price = 1 // Safe positive price: prevents uint64 underflow
+						}
 					}
 				} else {
 					// Sell near best bid to trigger trade, or near best ask to add liquidity
@@ -150,8 +161,7 @@ func (sim *MarketSimulator) Start() {
 					Timestamp: time.Now().UnixNano(),
 				}
 
-				sim.wal.LogPlace(order)
-				trades, err := sim.eng.ProcessOrder(order)
+				trades, err := sim.eng.ProcessOrderWithWAL(order, sim.wal)
 				if err == nil && len(trades) > 0 {
 					sim.hub.BroadcastJSON(map[string]interface{}{
 						"type":   "trades",

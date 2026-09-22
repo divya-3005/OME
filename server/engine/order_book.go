@@ -118,8 +118,9 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 			currMaker = nextMaker
 		}
 
-		// If this price level has no more orders, remove it from Asks
+		// If this price level has no more orders, remove it from Asks without memory leak
 		if bestAsk.IsEmpty() {
+			ob.Asks[0] = nil // Avoid pointer retention in backing array
 			ob.Asks = ob.Asks[1:]
 		}
 	}
@@ -176,7 +177,9 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 			currMaker = nextMaker
 		}
 
+		// If this price level has no more orders, remove it from Bids without memory leak
 		if bestBid.IsEmpty() {
+			ob.Bids[0] = nil // Avoid pointer retention in backing array
 			ob.Bids = ob.Bids[1:]
 		}
 	}
@@ -200,8 +203,8 @@ func (ob *OrderBook) HasOrder(orderID uint64) bool {
 	return exists
 }
 
-// ProcessOrder is the thread-safe entry point to submit an order
-func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
+// ProcessOrderWithWAL atomically validates, persists to WAL with fsync, and processes an order within the book lock
+func (ob *OrderBook) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
@@ -221,20 +224,44 @@ func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
 		return nil, fmt.Errorf("limit order price must be greater than 0")
 	}
 
+	// Persist to WAL and sync atomically inside lock to avoid TOCTOU races
+	if wal != nil {
+		if err := wal.LogPlace(order); err != nil {
+			return nil, fmt.Errorf("WAL log error: %w", err)
+		}
+		if err := wal.Sync(); err != nil {
+			return nil, fmt.Errorf("WAL sync error: %w", err)
+		}
+	}
+
 	if order.Side == Buy {
 		return ob.matchBuyOrder(order), nil
 	}
 	return ob.matchSellOrder(order), nil
 }
 
-// CancelOrder is the thread-safe entry point to cancel an existing order by ID
-func (ob *OrderBook) CancelOrder(orderID uint64) bool {
+// ProcessOrder is the thread-safe entry point to submit an order without WAL
+func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
+	return ob.ProcessOrderWithWAL(order, nil)
+}
+
+// CancelOrderWithWAL atomically validates, persists to WAL with fsync, and cancels an order within the book lock
+func (ob *OrderBook) CancelOrderWithWAL(orderID uint64, wal *WAL) (bool, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
 	order, exists := ob.Orders[orderID]
 	if !exists {
-		return false
+		return false, fmt.Errorf("order ID %d not found", orderID)
+	}
+
+	if wal != nil {
+		if err := wal.LogCancel(ob.Symbol, orderID); err != nil {
+			return false, fmt.Errorf("WAL cancel error: %w", err)
+		}
+		if err := wal.Sync(); err != nil {
+			return false, fmt.Errorf("WAL sync error: %w", err)
+		}
 	}
 
 	if order.Side == Buy {
@@ -245,7 +272,9 @@ func (ob *OrderBook) CancelOrder(orderID uint64) bool {
 			level := ob.Bids[idx]
 			level.RemoveOrder(order)
 			if level.IsEmpty() {
-				ob.Bids = append(ob.Bids[:idx], ob.Bids[idx+1:]...)
+				copy(ob.Bids[idx:], ob.Bids[idx+1:])
+				ob.Bids[len(ob.Bids)-1] = nil // Avoid memory leak in backing array
+				ob.Bids = ob.Bids[:len(ob.Bids)-1]
 			}
 		}
 	} else {
@@ -256,13 +285,21 @@ func (ob *OrderBook) CancelOrder(orderID uint64) bool {
 			level := ob.Asks[idx]
 			level.RemoveOrder(order)
 			if level.IsEmpty() {
-				ob.Asks = append(ob.Asks[:idx], ob.Asks[idx+1:]...)
+				copy(ob.Asks[idx:], ob.Asks[idx+1:])
+				ob.Asks[len(ob.Asks)-1] = nil // Avoid memory leak in backing array
+				ob.Asks = ob.Asks[:len(ob.Asks)-1]
 			}
 		}
 	}
 
 	delete(ob.Orders, orderID)
-	return true
+	return true, nil
+}
+
+// CancelOrder is the thread-safe entry point to cancel an existing order by ID without WAL
+func (ob *OrderBook) CancelOrder(orderID uint64) bool {
+	ok, _ := ob.CancelOrderWithWAL(orderID, nil)
+	return ok
 }
 
 // GetSnapshot returns a thread-safe copy of bids and asks for L2 market data
