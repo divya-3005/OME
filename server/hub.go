@@ -217,7 +217,9 @@ func (h *Hub) RecordTrades(symbol string, trades []*engine.Trade) {
 	list := h.recentTrades[symbol]
 	list = append(list, trades...)
 	if len(list) > 200 {
-		list = list[len(list)-200:]
+		trimmed := make([]*engine.Trade, 200)
+		copy(trimmed, list[len(list)-200:])
+		list = trimmed
 	}
 	h.recentTrades[symbol] = list
 }

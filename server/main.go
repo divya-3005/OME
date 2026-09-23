@@ -84,7 +84,12 @@ func main() {
 	})
 	mux.Handle("/", http.FileServer(http.Dir(resolvePublicDir())))
 
-	srv := &http.Server{Addr: ":8080", Handler: mux}
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

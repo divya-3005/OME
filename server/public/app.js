@@ -677,6 +677,7 @@ function connectWebSocket() {
     wsStatus.innerHTML = '<span class="dot-pulse"></span><span class="telemetry-val">WS LIVE</span>';
     fetchOrderBook();
     syncBotStatus();
+    SYMBOLS.forEach(sym => hydrateTradeHistory(sym));
   };
 
   state.ws.onmessage = (event) => {
@@ -839,10 +840,25 @@ function formatPct(pct) {
   };
 }
 
+const seenTradeKeys = new Set();
+
+function getTradeKey(symbol, trade) {
+  return `${symbol}-${trade.maker_order_id}-${trade.taker_order_id}-${trade.timestamp}-${trade.price}-${trade.amount}`;
+}
+
 // Updates stats, trade history and candles for ANY symbol; DOM only for the active one.
 function recordTrade(symbol, trade) {
   const stats = state.statsBySymbol[symbol];
   if (!stats) return;
+
+  const key = getTradeKey(symbol, trade);
+  if (seenTradeKeys.has(key)) return;
+  seenTradeKeys.add(key);
+  if (seenTradeKeys.size > 5000) {
+    const oldest = seenTradeKeys.values().next().value;
+    seenTradeKeys.delete(oldest);
+  }
+
   const price = trade.price / 100;
 
   if (stats.openPrice === null) stats.openPrice = price;
@@ -1112,7 +1128,7 @@ document.querySelectorAll('.quick-btn').forEach(btn => {
 
 symbolTabs.addEventListener('click', (e) => {
   const btn = e.target.closest('.tab-btn');
-  if (!btn) return;
+  if (!btn || btn.dataset.symbol === state.activeSymbol) return;
 
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
