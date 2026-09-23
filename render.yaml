@@ -6,8 +6,6 @@ services:
     buildCommand: go build -o ../matching-engine .
     startCommand: ../matching-engine
     envVars:
-      - key: PORT
-        generateValue: false
       - key: WAL_PATH
         value: /data/wal.log
     disk:
