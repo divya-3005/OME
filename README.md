@@ -12,8 +12,8 @@ Benchmarked on an Apple M3 (8-core ARM64) using Go 1.22 (see server/go.mod):
 
 | Metric | In-Memory Engine Benchmark | Details |
 | :--- | :--- | :--- |
-| **Engine-Level Throughput** | **~4.63M iterations/s (~9.26M orders/s)** | Sustained 2-order match + replenish loop |
-| **Mean Execution Latency** | **215.9 ns/op (≈ 108.0 ns per order)** | 1 op = 1 matching buy + 1 replenishing sell |
+| **Engine-Level Throughput** | **~5.60M iterations/s (~11.20M orders/s)** | Sustained 2-order match + replenish loop |
+| **Mean Execution Latency** | **178.5 ns/op (≈ 89.3 ns per order)** | 1 op = 1 matching buy + 1 replenishing sell |
 | **Memory Allocation** | **232 B / op** | Intrusive DLL avoids separate node allocations |
 | **Allocations** | **4 allocs / op** | one `Order` per submitted order, plus one `Trade` and one trades-slice allocation per match |
 
@@ -22,12 +22,12 @@ goos: darwin
 goarch: arm64
 pkg: github.com/divya-3005/OME/server/engine
 cpu: Apple M3
-BenchmarkProcessOrder-8          	 6128059	       215.9 ns/op	     232 B/op	       4 allocs/op
-BenchmarkProcessOrderWithWAL-8   	     212	   6079843 ns/op	     552 B/op	       8 allocs/op
+BenchmarkProcessOrder-8          	 6058138	       178.5 ns/op	     232 B/op	       4 allocs/op
+BenchmarkProcessOrderWithWAL-8   	     250	   5264047 ns/op	     552 B/op	       8 allocs/op
 PASS
 ```
 
-> **Note on Benchmark Methodology**: Each iteration submits a buy that matches one resting ask, then replenishes one unit at the exact traded price, so the book shape is constant and every iteration exercises the matching path. It reflects the mean latency of an active matching cycle (one incoming aggressor order matched against the book + one replenishment limit order) in memory. It is not an end-to-end figure through the HTTP layer, JSON deserialization, disk WAL fsync, and WebSocket fan-out, where throughput is bounded by network and disk I/O rather than the matching algorithm itself. For disk-persisted durability, `BenchmarkProcessOrderWithWAL` measures the synchronous Write-Ahead Log path with atomic `fsync` per transaction.
+> **Note on Benchmark Methodology**: Each iteration submits a buy that matches one resting ask, then replenishes one unit at the exact traded price, so the book shape is constant and every iteration exercises the matching path. It reflects the mean latency of an active matching cycle (one incoming aggressor order matched against the book + one replenishment limit order) in memory. It is not an end-to-end figure through the HTTP layer, JSON deserialization, disk WAL fsync, and WebSocket fan-out, where throughput is bounded by network and disk I/O rather than the matching algorithm itself. For disk-persisted durability, `BenchmarkProcessOrderWithWAL` measures the synchronous Write-Ahead Log path with atomic `fsync` per transaction. The 552 B/op in `BenchmarkProcessOrderWithWAL` reflects the 232 B in-memory matching lifecycle plus two JSON record marshals (one buy match + one replenishment sell).
 
 ---
 
@@ -59,7 +59,7 @@ graph TD
   - **Cancel order**: O(log P) binary search to find the price level, then O(1) unlink; if the level empties, an extra O(P) slice shift.
 - **Garbage-Collector Safe**: Pointer references are explicitly zeroed during level eviction, preventing backing-array memory retention.
 
-### 2. $O(1)$ Order Cancellations & Unified ID Namespace
+### 2. $O(1)$ Order Lookup by ID & Unified ID Namespace
 - **Instant Cancellations**: An internal `Orders map[uint64]*Order` enables instant O(1) order lookup by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
 - **Unified ID Namespace & Reconciliation**: Order IDs are always assigned by the server (`eng.NextOrderID()`), and requests that include an `id` are rejected with 400. After WAL recovery the generator is advanced past the highest recovered ID (`SetMinOrderID`).
 
@@ -75,12 +75,12 @@ graph TD
 
 ### 5. Durability via Write-Ahead Logging (WAL) & fsync
 - **Admission-Gated Logging**: Only pre-validated, admissible orders are logged to disk (`wal.log`), adhering to strict WAL discipline (unregistered symbols or duplicate payloads are rejected before dirtying the log).
-- **Durable append**: each placement/cancellation is written and `fsync`ed under one lock before the HTTP response. On a failed write the file is rolled back to its previous length; on a failed `fsync` the log is rolled back and disabled (all further orders get 503) until restart.
-- **Recovery**: replays every record. An incomplete or corrupt *final* record, which was never acknowledged, is dropped. Corruption *followed by more records* aborts startup instead of truncating acknowledged data.
+- **Durable append**: each placement/cancellation is written and `fsync`ed under one lock before the HTTP response. On a failed write the file is rolled back to its previous length; on a failed `fsync` the log is rolled back and disabled (all further orders get 503) until restart. (Note: directory entry synchronization on initial file creation is filesystem-dependent).
+- **Recovery**: replays every record. An incomplete or corrupt *final* record, which was never acknowledged, is dropped. Corruption *followed by more records* aborts startup instead of truncating acknowledged data. Replay into engine order books is executed outside the WAL lock to maintain strict lock hierarchy.
 
 ### 6. Institutional Trading Terminal (Web UI)
-- **Live L2 Order Book**: Real-time Bids (Green) and Asks (Red) with dynamic depth bars.
-- **Japanese Candlestick Chart**: Real-time OHLC candles with high/low wicks, volume histogram sub-plot, and interactive crosshair, built only from live trades, bucketed into 15-second intervals by trade timestamp.
+- **Live L2 Order Book**: Real-time Bids (Green) and Asks (Red) with dynamic depth bars, click-to-trade, and top-15 level display.
+- **Japanese Candlestick Chart**: Real-time OHLC candles with high/low wicks, live price line, glowing axis badge, volume histogram sub-plot, and interactive crosshair, built only from live trades, bucketed into 15-second intervals by trade timestamp.
 - **Step-Staircase Market Depth Chart**: True step curves (`_|-|_`) visualizing cumulative liquidity slopes with hover tooltips.
 - **Market Simulator Bot**: Automated background bot injecting realistic liquidity and trades with one-click pause/resume.
 - **Session Ticker Stats**: high, low, volume and change computed from trades received since the page loaded.
@@ -94,12 +94,12 @@ graph TD
 
 ## 🎯 Key Engineering Highlights
 
-- **Engineered a high-throughput in-memory Order Matching Engine in Go**, achieving an engine-level throughput of **~9.26M orders/sec** with a mean matching latency of **215.9 ns/op (1 op = 1 matching buy + 1 replenishing sell, ≈ 108.0 ns per order)** using Price-Time Priority (FIFO).
+- **Engineered a high-throughput in-memory Order Matching Engine in Go**, achieving an engine-level throughput of **~11.20M orders/sec** with a mean matching latency of **178.5 ns/op (1 op = 1 matching buy + 1 replenishing sell, ≈ 89.3 ns per order)** using Price-Time Priority (FIFO).
 - **Architected O(1) queue operations within a price level and O(log P) price-level lookup** utilizing intrusive Doubly Linked Lists for price-level order queues, binary search ($O(\log P)$) for sorted price levels, and an indexed hash map for instant order cancellations.
 - **Implemented fine-grained concurrency**, isolating mutex locks per order book to enable parallel matching across asset books and race-free coordination between HTTP endpoints, WebSocket broadcasts, and background simulation bots (verified via Go's `-race` detector).
 - **Implemented Limit and Market order execution**, supporting multi-level liquidity sweeps and zero-loss fixed-point integer pricing (`uint64`).
 - **Built Write-Ahead Logging (WAL) for durability**, persisting order transitions to disk and enabling deterministic crash recovery on startup.
-- **Developed a real-time WebSocket market data feed and institutional trading workstation** featuring an L2 order book, Japanese Candlestick chart, step-staircase liquidity depth chart, and background market maker bot.
+- **Developed a real-time WebSocket market data feed and institutional trading workstation** featuring an L2 order book, Japanese Candlestick chart with live price badge, step-staircase liquidity depth chart, and background market maker bot.
 
 ---
 
@@ -128,17 +128,17 @@ go test -bench=. -benchmem -run=^$ ./...
 
 ## 📡 API Reference
 
-> **Security & Content Negotiation**: `Content-Type: application/json` is required (415 otherwise). Browser requests from untrusted origins get 403.
+> **Security & Content Negotiation**: `POST /order` requires `Content-Type: application/json` (returns 415 otherwise). State-changing requests from untrusted browser origins get 403.
 
 ### Status & Error Codes
 
 | Status Code | Reason |
 | :--- | :--- |
-| `400 Bad Request` | Invalid order payload, unknown symbol, or client-supplied `id` |
+| `400 Bad Request` | Invalid order payload, unknown symbol (`POST /order`, `DELETE /order`), or client-supplied `id` |
 | `403 Forbidden` | Origin header not allowed (state-changing browser requests) |
-| `404 Not Found` | Symbol not found or order ID not found for cancellation |
+| `404 Not Found` | Symbol not found (`GET /orderbook`) or order ID not found for cancellation (`DELETE /order`) |
 | `409 Conflict` | Duplicate order ID (internal safeguard) |
-| `415 Unsupported Media Type` | Content-Type is not `application/json` |
+| `415 Unsupported Media Type` | Content-Type is not `application/json` on `POST /order` |
 | `503 Service Unavailable` | Write-Ahead Log (WAL) failure / append rejected |
 
 ### 1. Place an Order

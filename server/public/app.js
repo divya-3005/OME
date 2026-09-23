@@ -285,7 +285,34 @@ function renderPriceChart() {
     }
   });
 
-  // 3. Interactive Crosshair & Hover Tooltip
+  // 3. Live Price Line & Glowing Badge
+  const lastCandle = list[list.length - 1];
+  const lastY = priceToY(lastCandle.close);
+  const liveColor = lastCandle.close >= lastCandle.open ? '#00f090' : '#ff3358';
+
+  ctx.strokeStyle = liveColor;
+  ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, lastY);
+  ctx.lineTo(chartW, lastY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Live Price Badge on Axis
+  const badgeW = 62;
+  const badgeH = 18;
+  ctx.fillStyle = liveColor;
+  ctx.beginPath();
+  ctx.roundRect(chartW + 4, lastY - badgeH / 2, badgeW, badgeH, 3);
+  ctx.fill();
+
+  ctx.fillStyle = '#000000';
+  ctx.font = 'bold 10px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`$${lastCandle.close.toFixed(2)}`, chartW + 4 + badgeW / 2, lastY + 3.5);
+
+  // 4. Interactive Crosshair & Hover Tooltip
   if (state.hoverPriceChart && state.hoverPriceChart.x <= chartW && state.hoverPriceChart.y <= chartH) {
     const { x, y } = state.hoverPriceChart;
     const hoveredIdx = Math.floor(x / slotW);
@@ -693,36 +720,43 @@ function renderOrderBook(data) {
     return { ...b, cum: cumBid };
   });
 
-  const maxCum = Math.max(cumAsk, cumBid, 1);
+  const maxTotal = Math.max(cumAsk, cumBid, 1);
 
   // Render Asks (reversed so lowest ask is near spread)
-  const displayAsks = [...asksWithCum].reverse();
-  asksContainer.innerHTML = displayAsks.map(a => {
-    const priceFormatted = (a.price / 100).toFixed(2);
-    const depthPct = Math.min(100, Math.round((a.cum / maxCum) * 100));
-    return `
-      <div class="book-row ask-row" onclick="setPrice('${priceFormatted}')">
-        <div class="depth-bar depth-bar-ask" style="width: ${depthPct}%;"></div>
-        <span class="price-val">$${priceFormatted}</span>
-        <span class="size-val">${a.volume.toLocaleString()}</span>
-        <span class="total-val">${a.cum.toLocaleString()}</span>
-      </div>
-    `;
-  }).join('');
+  if (asksWithCum.length === 0) {
+    asksContainer.innerHTML = '<div class="empty-state">No asks resting</div>';
+  } else {
+    asksContainer.innerHTML = asksWithCum.slice(0, 15).reverse().map(a => {
+      const pct = Math.min((a.cum / maxTotal) * 100, 100);
+      const priceFormatted = (a.price / 100).toFixed(2);
+      return `
+        <div class="book-row ask-row" onclick="setPrice('${priceFormatted}')">
+          <div class="book-depth-bar" style="width: ${pct}%"></div>
+          <span class="book-price">${priceFormatted}</span>
+          <span>${a.volume.toLocaleString()}</span>
+          <span>${a.cum.toLocaleString()}</span>
+        </div>
+      `;
+    }).join('');
+  }
 
   // Render Bids (highest bid near spread)
-  bidsContainer.innerHTML = bidsWithCum.map(b => {
-    const priceFormatted = (b.price / 100).toFixed(2);
-    const depthPct = Math.min(100, Math.round((b.cum / maxCum) * 100));
-    return `
-      <div class="book-row bid-row" onclick="setPrice('${priceFormatted}')">
-        <div class="depth-bar depth-bar-bid" style="width: ${depthPct}%;"></div>
-        <span class="price-val">$${priceFormatted}</span>
-        <span class="size-val">${b.volume.toLocaleString()}</span>
-        <span class="total-val">${b.cum.toLocaleString()}</span>
-      </div>
-    `;
-  }).join('');
+  if (bidsWithCum.length === 0) {
+    bidsContainer.innerHTML = '<div class="empty-state">No bids resting</div>';
+  } else {
+    bidsContainer.innerHTML = bidsWithCum.slice(0, 15).map(b => {
+      const pct = Math.min((b.cum / maxTotal) * 100, 100);
+      const priceFormatted = (b.price / 100).toFixed(2);
+      return `
+        <div class="book-row bid-row" onclick="setPrice('${priceFormatted}')">
+          <div class="book-depth-bar" style="width: ${pct}%"></div>
+          <span class="book-price">${priceFormatted}</span>
+          <span>${b.volume.toLocaleString()}</span>
+          <span>${b.cum.toLocaleString()}</span>
+        </div>
+      `;
+    }).join('');
+  }
 
   // Update Spread Indicator
   if (bids.length > 0 && asks.length > 0) {
@@ -734,10 +768,10 @@ function renderOrderBook(data) {
     const bps = ((spreadCents / midPrice) * 10000).toFixed(1);
 
     spreadValue.textContent = `$${spreadDollars}`;
-    spreadBps.textContent = `${bps} BPS`;
+    spreadBps.textContent = `(${bps} bps)`;
   } else {
     spreadValue.textContent = '—';
-    spreadBps.textContent = '—';
+    spreadBps.textContent = '';
   }
 }
 

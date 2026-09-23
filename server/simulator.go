@@ -95,7 +95,11 @@ func (sim *MarketSimulator) EnsureLiquidity(symbol string) {
 	case !hasAsk:
 		sim.placeLadder(symbol, engine.Sell, bid)
 	case !hasBid:
-		sim.placeLadder(symbol, engine.Buy, ask)
+		if ask <= 10 {
+			sim.SeedSymbol(symbol)
+		} else {
+			sim.placeLadder(symbol, engine.Buy, ask)
+		}
 	}
 }
 

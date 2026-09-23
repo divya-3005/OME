@@ -121,19 +121,21 @@ func (w *WAL) rollback(offset int64) error {
 //     because truncating would destroy acknowledged records. The caller must refuse to start.
 func (w *WAL) Recover(eng *Engine) (uint64, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
+		w.mu.Unlock()
 		return 0, err
 	}
 
 	reader := bufio.NewReader(w.file)
 	var validOffset int64
 	var maxOrderID uint64
+	var entries []WALEntry
 
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if readErr != nil && readErr != io.EOF {
+			w.mu.Unlock()
 			return maxOrderID, fmt.Errorf("WAL read error at offset %d: %w", validOffset, readErr)
 		}
 		if len(line) == 0 {
@@ -153,43 +155,53 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 			}
 			if err != nil {
 				if _, peekErr := reader.Peek(1); peekErr == nil {
+					w.mu.Unlock()
 					return maxOrderID, fmt.Errorf("WAL corrupt at offset %d with more records after it; refusing to truncate acknowledged data: %w", validOffset, err)
 				}
 				log.Printf("WAL recovery: dropping corrupt final record at offset %d: %v", validOffset, err)
 				break
 			}
-
-			switch entry.Action {
-			case "PLACE":
-				eng.RegisterSymbol(entry.Order.Symbol)
-				if entry.Order.ID > maxOrderID {
-					maxOrderID = entry.Order.ID
-				}
-				if _, err := eng.ProcessOrder(entry.Order); err != nil {
-					log.Printf("WAL recovery: warning replaying order %d: %v", entry.Order.ID, err)
-				}
-			case "CANCEL":
-				if entry.OrderID > maxOrderID {
-					maxOrderID = entry.OrderID
-				}
-				if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
-					log.Printf("WAL recovery: warning replaying cancel for order %d: %v", entry.OrderID, err)
-				}
-			}
+			entries = append(entries, entry)
 		}
 		validOffset += int64(len(line))
 	}
 
 	if err := w.file.Truncate(validOffset); err != nil {
+		w.mu.Unlock()
 		return maxOrderID, fmt.Errorf("failed to truncate WAL tail: %w", err)
 	}
 	if err := w.file.Sync(); err != nil {
+		w.mu.Unlock()
 		return maxOrderID, fmt.Errorf("failed to sync WAL after truncation: %w", err)
 	}
 	if _, err := w.file.Seek(validOffset, io.SeekStart); err != nil {
+		w.mu.Unlock()
 		return maxOrderID, fmt.Errorf("failed to seek to WAL tail: %w", err)
 	}
 	w.size = validOffset
+	w.mu.Unlock()
+
+	// Replay entries into eng outside w.mu.
+	// This avoids any lock-order inversion between w.mu and engine book mutexes.
+	for _, entry := range entries {
+		switch entry.Action {
+		case "PLACE":
+			eng.RegisterSymbol(entry.Order.Symbol)
+			if entry.Order.ID > maxOrderID {
+				maxOrderID = entry.Order.ID
+			}
+			if _, err := eng.ProcessOrder(entry.Order); err != nil {
+				log.Printf("WAL recovery: warning replaying order %d: %v", entry.Order.ID, err)
+			}
+		case "CANCEL":
+			if entry.OrderID > maxOrderID {
+				maxOrderID = entry.OrderID
+			}
+			if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
+				log.Printf("WAL recovery: warning replaying cancel for order %d: %v", entry.OrderID, err)
+			}
+		}
+	}
 
 	eng.SetMinOrderID(maxOrderID + 1)
 	return maxOrderID, nil
