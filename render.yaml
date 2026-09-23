@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: matching-engine
+    runtime: go
+    rootDir: server
+    buildCommand: go build -o ../matching-engine .
+    startCommand: ../matching-engine
+    envVars:
+      - key: PORT
+        generateValue: false
+      - key: WAL_PATH
+        value: /data/wal.log
+    disk:
+      name: wal-data
+      mountPath: /data
+      sizeGB: 1

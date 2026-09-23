@@ -84,8 +84,12 @@ func main() {
 	})
 	mux.Handle("/", http.FileServer(http.Dir(resolvePublicDir())))
 
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 	srv := &http.Server{
-		Addr:              ":8080",
+		Addr:              ":" + port,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -96,8 +100,8 @@ func main() {
 
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- srv.ListenAndServe() }()
-	log.Println("Order Matching Engine running on http://localhost:8080")
-	log.Println("WebSocket stream available at ws://localhost:8080/ws")
+	log.Printf("Order Matching Engine running on http://localhost:%s", port)
+	log.Printf("WebSocket stream available at ws://localhost:%s/ws", port)
 
 	exitCode := 0
 	select {
