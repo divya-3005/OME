@@ -9,8 +9,7 @@ import (
 )
 
 func TestWALRecovery(t *testing.T) {
-	tempFile := "test_wal.log"
-	defer os.Remove(tempFile)
+	tempFile := filepath.Join(t.TempDir(), "test_wal.log")
 
 	// 1. Create WAL and log actions
 	wal, err := OpenWAL(tempFile)
@@ -64,8 +63,7 @@ func TestWALRecovery(t *testing.T) {
 }
 
 func TestWALTruncatedRecovery(t *testing.T) {
-	tempFile := "test_trunc_wal.log"
-	defer os.Remove(tempFile)
+	tempFile := filepath.Join(t.TempDir(), "test_trunc_wal.log")
 
 	// 1. Write two valid orders
 	wal, err := OpenWAL(tempFile)
@@ -140,8 +138,7 @@ func TestWALTruncatedRecovery(t *testing.T) {
 }
 
 func TestWALNilOrderRecovery(t *testing.T) {
-	tempFile := "test_nil_order_wal.log"
-	defer os.Remove(tempFile)
+	tempFile := filepath.Join(t.TempDir(), "test_nil_order_wal.log")
 
 	wal, err := OpenWAL(tempFile)
 	if err != nil {
@@ -278,3 +275,51 @@ func TestWALFailsClosedAfterWriteError(t *testing.T) {
 		t.Fatalf("expected WAL to stay disabled after an unrecoverable failure, got %v", err)
 	}
 }
+
+func TestWALInvalidOrderPayloadRecovery(t *testing.T) {
+	tempFile := filepath.Join(t.TempDir(), "invalid_order_wal.log")
+
+	wal, err := OpenWAL(tempFile)
+	if err != nil {
+		t.Fatalf("failed to open WAL: %v", err)
+	}
+	wal.LogPlace(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10})
+	wal.Close()
+
+	// Append valid JSON with action PLACE but invalid order payload (amount: 0, price: 0)
+	f, err := os.OpenFile(tempFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("failed to open file for append: %v", err)
+	}
+	_, err = f.Write([]byte(`{"action":"PLACE","order":{"id":2,"symbol":"AAPL","side":0,"type":0,"price":0,"amount":0}}` + "\n"))
+	f.Close()
+	if err != nil {
+		t.Fatalf("failed to write invalid payload line: %v", err)
+	}
+
+	engine := NewEngine()
+	wal2, err := OpenWAL(tempFile)
+	if err != nil {
+		t.Fatalf("failed to reopen WAL: %v", err)
+	}
+	defer wal2.Close()
+
+	maxID, err := wal2.Recover(engine)
+	if err != nil {
+		t.Fatalf("unexpected error recovering after invalid order payload: %v", err)
+	}
+	if maxID != 1 {
+		t.Errorf("expected maxID to be 1, got %d", maxID)
+	}
+
+	aapl, exists := engine.GetOrderBook("AAPL")
+	if !exists || len(aapl.Orders) != 1 {
+		t.Fatalf("expected 1 order recovered in engine, got %v", aapl)
+	}
+
+	// Verify WAL is still cleanly appendable
+	if err := wal2.LogPlace(&Order{ID: 3, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 105, Amount: 5}); err != nil {
+		t.Fatalf("failed to log order 3 to pruned WAL: %v", err)
+	}
+}
+

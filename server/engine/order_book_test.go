@@ -17,7 +17,7 @@ func TestFullMatch(t *testing.T) {
 		Side:      Sell,
 		Price:     100,
 		Amount:    10,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: time.Now().UnixMilli(),
 	}
 
 	// Bob wants to buy 10 shares at $100
@@ -27,7 +27,7 @@ func TestFullMatch(t *testing.T) {
 		Side:      Buy,
 		Price:     100,
 		Amount:    10,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: time.Now().UnixMilli(),
 	}
 
 	// Alice's order rests on the book (no trades yet)
@@ -113,7 +113,7 @@ func TestCancelOrder(t *testing.T) {
 		Side:      Buy,
 		Price:     100,
 		Amount:    10,
-		Timestamp: time.Now().UnixNano(),
+		Timestamp: time.Now().UnixMilli(),
 	}
 
 	// Place the order
@@ -325,7 +325,7 @@ func TestConcurrentOrders(t *testing.T) {
 					Type:      Limit,
 					Price:     price,
 					Amount:    5,
-					Timestamp: time.Now().UnixNano(),
+					Timestamp: time.Now().UnixMilli(),
 				})
 
 				// Concurrently read snapshot and top-of-book
@@ -352,3 +352,133 @@ func TestRejectsOversizedAmount(t *testing.T) {
 		t.Fatalf("expected ErrInvalidOrder, got %v", err)
 	}
 }
+
+func TestRemoveOrderUnlinkedSafe(t *testing.T) {
+	pl := NewPriceLevel(100)
+	order1 := &Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10}
+	order2 := &Order{ID: 2, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 20}
+	pl.AddOrder(order1)
+	pl.AddOrder(order2)
+
+	unlinked := &Order{ID: 3, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 50}
+	pl.RemoveOrder(unlinked)
+
+	if pl.Head != order1 || pl.Tail != order2 {
+		t.Fatalf("unlinked order corrupted price level queue: head=%v tail=%v", pl.Head, pl.Tail)
+	}
+	if pl.TotalVolume != 30 {
+		t.Fatalf("expected total volume 30, got %d", pl.TotalVolume)
+	}
+}
+
+func TestOrderBookRejectsMismatchedSymbol(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+	_, err := ob.ProcessOrder(&Order{ID: 1, Symbol: "TSLA", Side: Buy, Type: Limit, Price: 100, Amount: 10})
+	if !errors.Is(err, ErrInvalidOrder) {
+		t.Fatalf("expected ErrInvalidOrder for symbol mismatch, got %v", err)
+	}
+}
+
+func TestRemoveOrderPriceMismatch(t *testing.T) {
+	pl := NewPriceLevel(100)
+	order1 := &Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10}
+	pl.AddOrder(order1)
+
+	// Order with different price
+	wrongPriceOrder := &Order{ID: 2, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 200, Amount: 10}
+	pl.RemoveOrder(wrongPriceOrder)
+
+	if pl.TotalVolume != 10 {
+		t.Fatalf("expected TotalVolume 10, got %d", pl.TotalVolume)
+	}
+	if pl.Head != order1 || pl.Tail != order1 {
+		t.Fatalf("queue corrupted by removing mismatched price order")
+	}
+}
+
+func TestDuplicateOrderIDAfterExecution(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+
+	// 1. Sell order rests on book
+	_, err := ob.ProcessOrder(&Order{ID: 100, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 15000, Amount: 10})
+	if err != nil {
+		t.Fatalf("unexpected error placing sell: %v", err)
+	}
+
+	// 2. Buy order matches fully
+	_, err = ob.ProcessOrder(&Order{ID: 101, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 15000, Amount: 10})
+	if err != nil {
+		t.Fatalf("unexpected error placing buy: %v", err)
+	}
+
+	// Neither order is in ob.Orders anymore
+	if _, ok := ob.Orders[100]; ok {
+		t.Fatalf("order 100 should have been removed after full match")
+	}
+	if _, ok := ob.Orders[101]; ok {
+		t.Fatalf("order 101 should not be in ob.Orders after full match")
+	}
+
+	// 3. Re-submitting order 100 must be rejected
+	_, err = ob.ProcessOrder(&Order{ID: 100, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 14000, Amount: 5})
+	if !errors.Is(err, ErrDuplicateOrderID) {
+		t.Fatalf("expected ErrDuplicateOrderID when reusing executed ID 100, got %v", err)
+	}
+
+	// 4. Re-submitting order 101 must also be rejected
+	_, err = ob.ProcessOrder(&Order{ID: 101, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 16000, Amount: 5})
+	if !errors.Is(err, ErrDuplicateOrderID) {
+		t.Fatalf("expected ErrDuplicateOrderID when reusing executed ID 101, got %v", err)
+	}
+}
+
+func TestDuplicateOrderIDAfterCancellation(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+
+	_, err := ob.ProcessOrder(&Order{ID: 200, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 14000, Amount: 10})
+	if err != nil {
+		t.Fatalf("unexpected error placing buy: %v", err)
+	}
+
+	ok := ob.CancelOrder(200)
+	if !ok {
+		t.Fatalf("unexpected failure cancelling order")
+	}
+
+	if _, exists := ob.Orders[200]; exists {
+		t.Fatalf("order 200 should have been removed from ob.Orders after cancellation")
+	}
+
+	// Reusing cancelled ID 200 must be rejected
+	_, err = ob.ProcessOrder(&Order{ID: 200, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 14000, Amount: 5})
+	if !errors.Is(err, ErrDuplicateOrderID) {
+		t.Fatalf("expected ErrDuplicateOrderID when reusing cancelled ID 200, got %v", err)
+	}
+}
+
+func TestGetOpenOrders(t *testing.T) {
+	eng := NewEngine()
+	eng.RegisterSymbol("AAPL")
+	ob, _ := eng.GetOrderBook("AAPL")
+
+	ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 14000, Amount: 5, Timestamp: 1000})
+	ob.ProcessOrder(&Order{ID: 2, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 14500, Amount: 10, Timestamp: 2000})
+	ob.ProcessOrder(&Order{ID: 3, Symbol: "AAPL", Side: Sell, Type: Limit, Price: 15500, Amount: 8, Timestamp: 3000})
+
+	openOrders := ob.GetOpenOrders()
+	if len(openOrders) != 3 {
+		t.Fatalf("expected 3 open orders, got %d", len(openOrders))
+	}
+
+	ordersFromEng, ok := eng.GetOpenOrders("AAPL")
+	if !ok || len(ordersFromEng) != 3 {
+		t.Fatalf("expected 3 open orders from engine, got ok=%v, len=%d", ok, len(ordersFromEng))
+	}
+
+	// Verify unknown symbol
+	_, ok = eng.GetOpenOrders("UNKNOWN")
+	if ok {
+		t.Fatalf("expected ok=false for unknown symbol open orders")
+	}
+}
+

@@ -22,10 +22,17 @@ const state = {
   recentTrades: Object.fromEntries(SYMBOLS.map(s => [s, []])),
   // Maker fills seen over WS for orders not yet in myOrders (POST response still in flight).
   earlyMakerFills: new Map(),
+  pendingSubmissions: 0,
   bookRequestId: 0,
-  lastBook: { bids: [], asks: [] },
+  lastBookBySymbol: Object.fromEntries(SYMBOLS.map(s => [s, { bids: [], asks: [] }])),
   hoverPriceChart: null,
   hoverDepthChart: null,
+};
+
+const REFERENCE_PRICES = {
+  'AAPL': '150.00',
+  'TSLA': '240.00',
+  'BTC-USD': '64000.00',
 };
 
 // DOM Elements
@@ -241,11 +248,13 @@ function renderPriceChart() {
   ctx.stroke();
 
   // 2. Draw Candlesticks & Volume Bars
-  const slotW = chartW / Math.max(list.length, 40); // fixed minimum slot count keeps candle width sane
+  const totalSlots = Math.max(list.length, 40);
+  const slotW = chartW / totalSlots; // fixed minimum slot count keeps candle width sane
   const candleW = Math.max(3, slotW * 0.68);
+  const startSlot = totalSlots - list.length; // right-align candles
 
   list.forEach((c, idx) => {
-    const x = idx * slotW + slotW / 2;
+    const x = (startSlot + idx) * slotW + slotW / 2;
     const isBull = c.close >= c.open;
     const color = isBull ? '#00f090' : '#ff3358';
     const volColor = isBull ? 'rgba(0, 240, 144, 0.22)' : 'rgba(255, 51, 88, 0.22)';
@@ -315,7 +324,8 @@ function renderPriceChart() {
   // 4. Interactive Crosshair & Hover Tooltip
   if (state.hoverPriceChart && state.hoverPriceChart.x <= chartW && state.hoverPriceChart.y <= chartH) {
     const { x, y } = state.hoverPriceChart;
-    const hoveredIdx = Math.floor(x / slotW);
+    const hoveredSlot = Math.floor(x / slotW);
+    const hoveredIdx = hoveredSlot - startSlot;
 
     if (hoveredIdx >= 0 && hoveredIdx < list.length) {
       const c = list[hoveredIdx];
@@ -366,14 +376,17 @@ function renderPriceChart() {
 // 4. Step-Staircase Market Depth Chart Engine
 // --------------------------------------------------------------------------
 function drawDepthChart(bids, asks) {
-  state.lastBook = { bids: bids || [], asks: asks || [] };
+  if (bids !== undefined && asks !== undefined) {
+    state.lastBookBySymbol[state.activeSymbol] = { bids: bids || [], asks: asks || [] };
+  }
   if (!depthCanvas || state.activeChartTab !== 'depth') return;
 
   const { ctx, width, height } = setupCanvasDPI(depthCanvas);
   ctx.clearRect(0, 0, width, height);
 
-  const b = state.lastBook.bids.slice(0, 24); // best (highest) first
-  const a = state.lastBook.asks.slice(0, 24); // best (lowest) first
+  const currentBook = state.lastBookBySymbol[state.activeSymbol] || { bids: [], asks: [] };
+  const b = currentBook.bids.slice(0, 24); // best (highest) first
+  const a = currentBook.asks.slice(0, 24); // best (lowest) first
 
   if (b.length === 0 && a.length === 0) {
     ctx.fillStyle = '#475569';
@@ -504,10 +517,18 @@ function drawDepthChart(bids, asks) {
     let text = '';
     if (onBidSide) {
       const lv = cumBids.filter(l => l.price >= p);
-      if (lv.length) text = `BIDS ≥ $${p.toFixed(2)} | DEPTH: ${lv[lv.length - 1].cum.toLocaleString()}`;
+      if (lv.length) {
+        text = `BIDS ≥ $${p.toFixed(2)} | DEPTH: ${lv[lv.length - 1].cum.toLocaleString()}`;
+      } else if (cumBids.length) {
+        text = `SPREAD | BEST BID: $${cumBids[0].price.toFixed(2)}`;
+      }
     } else {
       const lv = cumAsks.filter(l => l.price <= p);
-      if (lv.length) text = `ASKS ≤ $${p.toFixed(2)} | DEPTH: ${lv[lv.length - 1].cum.toLocaleString()}`;
+      if (lv.length) {
+        text = `ASKS ≤ $${p.toFixed(2)} | DEPTH: ${lv[lv.length - 1].cum.toLocaleString()}`;
+      } else if (cumAsks.length) {
+        text = `SPREAD | BEST ASK: $${cumAsks[0].price.toFixed(2)}`;
+      }
     }
 
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
@@ -560,12 +581,12 @@ depthCanvas.addEventListener('mousemove', (e) => {
     x: e.clientX - rect.left,
     y: e.clientY - rect.top,
   };
-  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+  drawDepthChart();
 });
 
 depthCanvas.addEventListener('mouseleave', () => {
   state.hoverDepthChart = null;
-  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+  drawDepthChart();
 });
 
 tabChartPrice.addEventListener('click', () => {
@@ -583,14 +604,14 @@ tabChartDepth.addEventListener('click', () => {
   tabChartPrice.classList.remove('active');
   priceCanvas.style.display = 'none';
   depthCanvas.style.display = 'block';
-  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+  drawDepthChart();
 });
 
 window.addEventListener('resize', () => {
   if (state.activeChartTab === 'price') {
     renderPriceChart();
   } else {
-    drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+    drawDepthChart();
   }
 });
 
@@ -712,6 +733,7 @@ async function fetchOrderBook() {
     const res = await fetch(`/orderbook?symbol=${encodeURIComponent(symbol)}`);
     if (!res.ok) return;
     const data = await res.json();
+    state.lastBookBySymbol[symbol] = { bids: data.bids || [], asks: data.asks || [] };
     // Drop responses superseded by a newer request or a tab switch.
     if (requestId !== state.bookRequestId || data.symbol !== state.activeSymbol) return;
     renderOrderBook(data);
@@ -834,7 +856,7 @@ function recordTrade(symbol, trade) {
   list.unshift(trade);
   if (list.length > 50) list.pop();
 
-  updateCandleOnTrade(symbol, price, trade.amount, trade.timestamp / 1e6);
+  updateCandleOnTrade(symbol, price, trade.amount, trade.timestamp);
 
   const tabPrice = document.getElementById(`tabPrice-${symbol}`);
   if (tabPrice) tabPrice.textContent = formatUSD(price);
@@ -848,7 +870,7 @@ function renderTradesStream() {
   }
   tradesStream.innerHTML = list.map(t => {
     const sideClass = t.side === 0 ? 'buy' : 'sell';
-    const time = new Date(t.timestamp / 1e6).toLocaleTimeString();
+    const time = new Date(t.timestamp).toLocaleTimeString();
     return `
       <div class="trade-row">
         <span class="trade-price ${sideClass}">$${(t.price / 100).toFixed(2)}</span>
@@ -881,20 +903,27 @@ function renderTickerForActiveSymbol() {
 // 10. Order Submission & State
 // --------------------------------------------------------------------------
 async function submitOrder() {
-  const amount = parseInt(inputAmount.value, 10);
-  if (!amount || amount <= 0) {
-    alert('Please enter a valid amount');
+  const rawAmount = inputAmount.value.trim();
+  const amount = Number(rawAmount);
+  if (!rawAmount || !Number.isInteger(amount) || amount <= 0) {
+    alert('Please enter a valid positive integer quantity');
     return;
   }
 
   let price = 0;
   if (state.type === 0) {
-    const rawPrice = parseFloat(inputPrice.value);
-    if (!rawPrice || rawPrice <= 0) {
+    const rawPrice = inputPrice.value.trim();
+    const numericPrice = parseFloat(rawPrice);
+    if (!rawPrice || isNaN(numericPrice) || numericPrice <= 0) {
       alert('Please enter a valid limit price');
       return;
     }
-    price = Math.round(rawPrice * 100);
+    // Convert dollars to integer cents via string parsing to avoid
+    // IEEE 754 floating-point rounding errors (e.g. 1.255 * 100 → 125.49...)
+    const parts = rawPrice.split('.');
+    const dollars = parseInt(parts[0] || '0', 10);
+    const decStr = (parts[1] || '00').padEnd(2, '0').slice(0, 2);
+    price = dollars * 100 + parseInt(decStr, 10);
   }
 
   const payload = {
@@ -905,6 +934,9 @@ async function submitOrder() {
     amount: amount,
   };
 
+  btnSubmitOrder.disabled = true;
+  btnSubmitOrder.style.opacity = '0.6';
+  state.pendingSubmissions++;
   try {
     const res = await fetch('/order', {
       method: 'POST',
@@ -927,11 +959,17 @@ async function submitOrder() {
         state.myOrders.push({ ...data.order, amount: remaining });
         renderOpenOrders();
       }
+    } else {
+      takeEarlyFills(data.order.id);
     }
 
     scheduleBookRefresh();
   } catch (err) {
     console.error('Submit order error:', err);
+  } finally {
+    btnSubmitOrder.disabled = false;
+    btnSubmitOrder.style.opacity = '1';
+    state.pendingSubmissions = Math.max(0, state.pendingSubmissions - 1);
   }
 }
 
@@ -987,8 +1025,10 @@ function updateOpenOrdersAfterMatch(trades) {
   trades.forEach(t => {
     const idx = state.myOrders.findIndex(o => o.id === t.maker_order_id);
     if (idx === -1) {
-      // Could be our own order whose POST response hasn't arrived yet.
-      state.earlyMakerFills.set(t.maker_order_id, (state.earlyMakerFills.get(t.maker_order_id) || 0) + t.amount);
+      // Record early maker fills only if we have an order submission in-flight
+      if (state.pendingSubmissions > 0) {
+        state.earlyMakerFills.set(t.maker_order_id, (state.earlyMakerFills.get(t.maker_order_id) || 0) + t.amount);
+      }
       return;
     }
     const o = state.myOrders[idx];
@@ -1000,8 +1040,8 @@ function updateOpenOrdersAfterMatch(trades) {
     }
   });
 
-  // Bound memory: keep only the most recent 1000 entries (Map preserves insertion order).
-  while (state.earlyMakerFills.size > 1000) {
+  // Bound memory: keep only the most recent entries
+  while (state.earlyMakerFills.size > 100) {
     state.earlyMakerFills.delete(state.earlyMakerFills.keys().next().value);
   }
   renderOpenOrders();
@@ -1080,15 +1120,23 @@ symbolTabs.addEventListener('click', (e) => {
   state.activeSymbol = btn.dataset.symbol;
   activeSymbolTag.textContent = state.activeSymbol;
 
-  if (state.activeSymbol === 'AAPL') {
-    inputPrice.value = '150.00';
-  } else if (state.activeSymbol === 'TSLA') {
-    inputPrice.value = '240.00';
-  } else if (state.activeSymbol === 'BTC-USD') {
-    inputPrice.value = '64000.00';
+  const symStats = state.statsBySymbol[state.activeSymbol];
+  if (symStats && symStats.lastPrice !== null) {
+    inputPrice.value = symStats.lastPrice.toFixed(2);
+  } else {
+    inputPrice.value = REFERENCE_PRICES[state.activeSymbol] || '100.00';
   }
   renderTickerForActiveSymbol();
   renderTradesStream();
+
+  // Clear order book and depth chart immediately to prevent flashing stale data
+  asksContainer.innerHTML = '<div class="empty-state">Loading order book...</div>';
+  bidsContainer.innerHTML = '<div class="empty-state">Loading order book...</div>';
+  spreadValue.textContent = '—';
+  spreadBps.textContent = '';
+  if (state.activeChartTab === 'depth') {
+    drawDepthChart();
+  }
 
   updateTotal();
   updateOHLCHeader();
@@ -1097,6 +1145,7 @@ symbolTabs.addEventListener('click', (e) => {
   }
   fetchOrderBook();
   renderOpenOrders();
+  hydrateTradeHistory(state.activeSymbol);
 });
 
 function renderBotButton() {
@@ -1140,10 +1189,34 @@ btnToggleAudio.addEventListener('click', () => {
 btnSubmitOrder.addEventListener('click', submitOrder);
 
 // --------------------------------------------------------------------------
-// 13. Initialization
+// 13. Hydration & Initial State Synchronization
 // --------------------------------------------------------------------------
+async function hydrateTradeHistory(symbol) {
+  try {
+    const res = await fetch(`/trades?symbol=${encodeURIComponent(symbol)}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.trades && Array.isArray(data.trades)) {
+      data.trades.forEach(t => recordTrade(symbol, t));
+      if (symbol === state.activeSymbol) {
+        renderTradesStream();
+        renderTickerForActiveSymbol();
+        updateOHLCHeader();
+        if (state.activeChartTab === 'price') renderPriceChart();
+      }
+    }
+  } catch (err) {
+    console.error('Failed to hydrate trade history:', err);
+  }
+}
+
+
+
 connectWebSocket();
 syncBotStatus();
+SYMBOLS.forEach(sym => {
+  hydrateTradeHistory(sym);
+});
 updateTotal();
 updateOHLCHeader();
 renderTickerForActiveSymbol();

@@ -2,8 +2,6 @@
    OME // Institutional Workstation Design System (v2.0)
    ========================================================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
-
 :root {
   /* Depth & Surface Hierarchy */
   --bg-abyss: #05070a;
@@ -274,7 +272,7 @@ body {
 }
 
 /* --------------------------------------------------------------------------
-   24h Ticker Statistics Bar
+   Session Ticker Statistics Bar
    -------------------------------------------------------------------------- */
 .ticker-bar {
   height: 36px;
@@ -730,8 +728,8 @@ body {
   background-color: rgba(255, 255, 255, 0.04) !important;
 }
 
-.book-row span:nth-child(2),
-.book-row span:nth-child(3) {
+.book-row span:nth-of-type(2),
+.book-row span:nth-of-type(3) {
   text-align: right;
   color: var(--text-secondary);
 }

@@ -26,6 +26,21 @@ func (e *WALEntry) validate() error {
 		if e.Order == nil {
 			return errors.New("PLACE entry has no order payload")
 		}
+		if e.Order.ID == 0 || e.Order.Symbol == "" {
+			return errors.New("PLACE entry missing order ID or symbol")
+		}
+		if e.Order.Side != Buy && e.Order.Side != Sell {
+			return fmt.Errorf("invalid side %d in PLACE entry", e.Order.Side)
+		}
+		if e.Order.Type != Limit && e.Order.Type != Market {
+			return fmt.Errorf("invalid type %d in PLACE entry", e.Order.Type)
+		}
+		if e.Order.Amount == 0 || e.Order.Amount > MaxOrderAmount {
+			return fmt.Errorf("invalid amount %d in PLACE entry", e.Order.Amount)
+		}
+		if e.Order.Type == Limit && (e.Order.Price == 0 || e.Order.Price > MaxOrderPrice) {
+			return fmt.Errorf("invalid limit price %d in PLACE entry", e.Order.Price)
+		}
 	case "CANCEL":
 		if e.Symbol == "" || e.OrderID == 0 {
 			return errors.New("CANCEL entry missing symbol or order_id")
@@ -46,12 +61,17 @@ type WAL struct {
 
 // OpenWAL opens or creates the WAL log file.
 func OpenWAL(path string) (*WAL, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
 	info, err := file.Stat()
 	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	// Seek to end so subsequent writes append rather than overwrite.
+	if _, err := file.Seek(0, io.SeekEnd); err != nil {
 		file.Close()
 		return nil, err
 	}
@@ -111,6 +131,9 @@ func (w *WAL) rollback(offset int64) error {
 	if err := w.file.Truncate(offset); err != nil {
 		return err
 	}
+	if _, err := w.file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
 	return w.file.Sync()
 }
 
@@ -134,7 +157,7 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 
 	for {
 		line, readErr := reader.ReadBytes('\n')
-		if readErr != nil && readErr != io.EOF {
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			w.mu.Unlock()
 			return maxOrderID, fmt.Errorf("WAL read error at offset %d: %w", validOffset, readErr)
 		}
@@ -154,7 +177,12 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 				err = entry.validate()
 			}
 			if err != nil {
-				if _, peekErr := reader.Peek(1); peekErr == nil {
+				remaining, peekErr := io.ReadAll(reader)
+				if peekErr != nil {
+					w.mu.Unlock()
+					return maxOrderID, fmt.Errorf("WAL read error at offset %d while verifying tail corruption: %w", validOffset, peekErr)
+				}
+				if len(bytes.TrimSpace(remaining)) > 0 {
 					w.mu.Unlock()
 					return maxOrderID, fmt.Errorf("WAL corrupt at offset %d with more records after it; refusing to truncate acknowledged data: %w", validOffset, err)
 				}
@@ -191,19 +219,19 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 				maxOrderID = entry.Order.ID
 			}
 			if _, err := eng.ProcessOrder(entry.Order); err != nil {
-				log.Printf("WAL recovery: warning replaying order %d: %v", entry.Order.ID, err)
+				return maxOrderID, fmt.Errorf("WAL recovery: failed replaying order %d: %w", entry.Order.ID, err)
 			}
 		case "CANCEL":
 			if entry.OrderID > maxOrderID {
 				maxOrderID = entry.OrderID
 			}
 			if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
-				log.Printf("WAL recovery: warning replaying cancel for order %d: %v", entry.OrderID, err)
+				return maxOrderID, fmt.Errorf("WAL recovery: failed replaying cancel for order %d: %w", entry.OrderID, err)
 			}
 		}
 	}
 
-	eng.SetMinOrderID(maxOrderID + 1)
+	eng.SetMinOrderID(maxOrderID)
 	return maxOrderID, nil
 }
 

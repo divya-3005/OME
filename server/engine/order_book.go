@@ -24,16 +24,18 @@ type OrderBook struct {
 	Asks []*PriceLevel // Sorted ascending: lowest price first
 
 	// Quick lookups
-	Orders map[uint64]*Order // OrderID -> *Order for O(1) cancellations
+	Orders     map[uint64]*Order    // OrderID -> *Order for O(1) cancellations
+	seenOrders map[uint64]struct{} // Lifetime order IDs seen by this book
 }
 
 // NewOrderBook initializes an empty OrderBook for a symbol
 func NewOrderBook(symbol string) *OrderBook {
 	return &OrderBook{
-		Symbol: symbol,
-		Bids:   make([]*PriceLevel, 0),
-		Asks:   make([]*PriceLevel, 0),
-		Orders: make(map[uint64]*Order),
+		Symbol:     symbol,
+		Bids:       make([]*PriceLevel, 0),
+		Asks:       make([]*PriceLevel, 0),
+		Orders:     make(map[uint64]*Order),
+		seenOrders: make(map[uint64]struct{}),
 	}
 }
 
@@ -99,7 +101,11 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 			// Deduct traded amount
 			order.Amount -= tradeAmount
 			currMaker.Amount -= tradeAmount
-			bestAsk.TotalVolume -= tradeAmount
+			if bestAsk.TotalVolume >= tradeAmount {
+				bestAsk.TotalVolume -= tradeAmount
+			} else {
+				bestAsk.TotalVolume = 0
+			}
 
 			trades = append(trades, &Trade{
 				Symbol:       ob.Symbol,
@@ -108,7 +114,7 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 				Side:         order.Side, // taker is buying
 				Amount:       tradeAmount,
 				Price:        currMaker.Price,
-				Timestamp:    time.Now().UnixNano(),
+				Timestamp:    time.Now().UnixMilli(),
 			})
 
 			// If maker order is completely filled, remove it
@@ -120,10 +126,11 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 			currMaker = nextMaker
 		}
 
-		// If this price level has no more orders, remove it from Asks without memory leak
+		// If this price level has no more orders, remove it from Asks without memory leak or capacity loss
 		if bestAsk.IsEmpty() {
-			ob.Asks[0] = nil // Avoid pointer retention in backing array
-			ob.Asks = ob.Asks[1:]
+			copy(ob.Asks, ob.Asks[1:])
+			ob.Asks[len(ob.Asks)-1] = nil // Avoid pointer retention in backing array
+			ob.Asks = ob.Asks[:len(ob.Asks)-1]
 		}
 	}
 
@@ -161,7 +168,11 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 
 			order.Amount -= tradeAmount
 			currMaker.Amount -= tradeAmount
-			bestBid.TotalVolume -= tradeAmount
+			if bestBid.TotalVolume >= tradeAmount {
+				bestBid.TotalVolume -= tradeAmount
+			} else {
+				bestBid.TotalVolume = 0
+			}
 
 			trades = append(trades, &Trade{
 				Symbol:       ob.Symbol,
@@ -170,7 +181,7 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 				Side:         order.Side,
 				Amount:       tradeAmount,
 				Price:        currMaker.Price,
-				Timestamp:    time.Now().UnixNano(),
+				Timestamp:    time.Now().UnixMilli(),
 			})
 
 			if currMaker.Amount == 0 {
@@ -181,10 +192,11 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 			currMaker = nextMaker
 		}
 
-		// If this price level has no more orders, remove it from Bids without memory leak
+		// If this price level has no more orders, remove it from Bids without memory leak or capacity loss
 		if bestBid.IsEmpty() {
-			ob.Bids[0] = nil // Avoid pointer retention in backing array
-			ob.Bids = ob.Bids[1:]
+			copy(ob.Bids, ob.Bids[1:])
+			ob.Bids[len(ob.Bids)-1] = nil // Avoid pointer retention in backing array
+			ob.Bids = ob.Bids[:len(ob.Bids)-1]
 		}
 	}
 
@@ -214,6 +226,12 @@ func (ob *OrderBook) validate(order *Order) error {
 	}
 	if order.ID == 0 {
 		return fmt.Errorf("%w: order ID must be positive", ErrInvalidOrder)
+	}
+	if order.Symbol != ob.Symbol {
+		return fmt.Errorf("%w: symbol %q does not match order book %q", ErrInvalidOrder, order.Symbol, ob.Symbol)
+	}
+	if _, exists := ob.seenOrders[order.ID]; exists {
+		return fmt.Errorf("%w: %d", ErrDuplicateOrderID, order.ID)
 	}
 	if _, exists := ob.Orders[order.ID]; exists {
 		return fmt.Errorf("%w: %d", ErrDuplicateOrderID, order.ID)
@@ -250,10 +268,13 @@ func (ob *OrderBook) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify fu
 		return nil, err
 	}
 
+	ob.seenOrders[order.ID] = struct{}{}
+
 	// LogPlace writes AND fsyncs; it returns an error wrapping ErrWAL on any failure,
 	// in which case nothing is applied to the book.
 	if wal != nil {
 		if err := wal.LogPlace(order); err != nil {
+			delete(ob.seenOrders, order.ID)
 			return nil, err
 		}
 	}
@@ -293,37 +314,47 @@ func (ob *OrderBook) CancelOrderWithWALNotify(orderID uint64, wal *WAL, notify f
 		return false, fmt.Errorf("%w: %d", ErrOrderNotFound, orderID)
 	}
 
+	var level *PriceLevel
+	var levelIdx int
+	var isBuy bool
+	if order.Side == Buy {
+		isBuy = true
+		levelIdx = sort.Search(len(ob.Bids), func(i int) bool {
+			return ob.Bids[i].Price <= order.Price
+		})
+		if levelIdx < len(ob.Bids) && ob.Bids[levelIdx].Price == order.Price {
+			level = ob.Bids[levelIdx]
+		}
+	} else {
+		levelIdx = sort.Search(len(ob.Asks), func(i int) bool {
+			return ob.Asks[i].Price >= order.Price
+		})
+		if levelIdx < len(ob.Asks) && ob.Asks[levelIdx].Price == order.Price {
+			level = ob.Asks[levelIdx]
+		}
+	}
+
+	if level == nil {
+		delete(ob.Orders, orderID)
+		return false, fmt.Errorf("%w: order %d not found in price level", ErrOrderNotFound, orderID)
+	}
+
 	if wal != nil {
 		if err := wal.LogCancel(ob.Symbol, orderID); err != nil {
 			return false, err
 		}
 	}
 
-	if order.Side == Buy {
-		idx := sort.Search(len(ob.Bids), func(i int) bool {
-			return ob.Bids[i].Price <= order.Price
-		})
-		if idx < len(ob.Bids) && ob.Bids[idx].Price == order.Price {
-			level := ob.Bids[idx]
-			level.RemoveOrder(order)
-			if level.IsEmpty() {
-				copy(ob.Bids[idx:], ob.Bids[idx+1:])
-				ob.Bids[len(ob.Bids)-1] = nil // Avoid memory leak in backing array
-				ob.Bids = ob.Bids[:len(ob.Bids)-1]
-			}
-		}
-	} else {
-		idx := sort.Search(len(ob.Asks), func(i int) bool {
-			return ob.Asks[i].Price >= order.Price
-		})
-		if idx < len(ob.Asks) && ob.Asks[idx].Price == order.Price {
-			level := ob.Asks[idx]
-			level.RemoveOrder(order)
-			if level.IsEmpty() {
-				copy(ob.Asks[idx:], ob.Asks[idx+1:])
-				ob.Asks[len(ob.Asks)-1] = nil // Avoid memory leak in backing array
-				ob.Asks = ob.Asks[:len(ob.Asks)-1]
-			}
+	level.RemoveOrder(order)
+	if level.IsEmpty() {
+		if isBuy {
+			copy(ob.Bids[levelIdx:], ob.Bids[levelIdx+1:])
+			ob.Bids[len(ob.Bids)-1] = nil // Avoid memory leak in backing array
+			ob.Bids = ob.Bids[:len(ob.Bids)-1]
+		} else {
+			copy(ob.Asks[levelIdx:], ob.Asks[levelIdx+1:])
+			ob.Asks[len(ob.Asks)-1] = nil // Avoid memory leak in backing array
+			ob.Asks = ob.Asks[:len(ob.Asks)-1]
 		}
 	}
 
@@ -381,4 +412,35 @@ func (ob *OrderBook) GetBestBidAsk() (bestBid uint64, bestAsk uint64, ok bool) {
 	}
 
 	return ob.Bids[0].Price, ob.Asks[0].Price, true
+}
+
+// OpenOrderSummary provides an immutable summary of a resting order
+type OpenOrderSummary struct {
+	ID        uint64    `json:"id"`
+	Symbol    string    `json:"symbol"`
+	Side      Side      `json:"side"`
+	Type      OrderType `json:"type"`
+	Price     uint64    `json:"price"`
+	Amount    uint64    `json:"amount"`
+	Timestamp int64     `json:"timestamp"`
+}
+
+// GetOpenOrders returns a thread-safe snapshot of all resting orders in the book
+func (ob *OrderBook) GetOpenOrders() []OpenOrderSummary {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+
+	orders := make([]OpenOrderSummary, 0, len(ob.Orders))
+	for _, o := range ob.Orders {
+		orders = append(orders, OpenOrderSummary{
+			ID:        o.ID,
+			Symbol:    o.Symbol,
+			Side:      o.Side,
+			Type:      o.Type,
+			Price:     o.Price,
+			Amount:    o.Amount,
+			Timestamp: o.Timestamp,
+		})
+	}
+	return orders
 }

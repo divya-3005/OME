@@ -18,9 +18,28 @@ import (
 
 var supportedSymbols = []string{"AAPL", "TSLA", "BTC-USD"}
 
+func resolvePublicDir() string {
+	if info, err := os.Stat("./public"); err == nil && info.IsDir() {
+		return "./public"
+	}
+	if info, err := os.Stat("./server/public"); err == nil && info.IsDir() {
+		return "./server/public"
+	}
+	return "./public"
+}
+
+func resolveWALPath() string {
+	if p := os.Getenv("WAL_PATH"); p != "" {
+		return p
+	}
+	if info, err := os.Stat("./server"); err == nil && info.IsDir() {
+		return "server/wal.log"
+	}
+	return "wal.log"
+}
+
 func main() {
 	eng := engine.NewEngine()
-	eng.SetMinOrderID(uint64(time.Now().UnixMilli()))
 
 	hub := NewHub()
 	go hub.Run()
@@ -29,7 +48,7 @@ func main() {
 		eng.RegisterSymbol(sym)
 	}
 
-	wal, err := engine.OpenWAL("wal.log")
+	wal, err := engine.OpenWAL(resolveWALPath())
 	if err != nil {
 		log.Fatalf("failed to open WAL: %v", err)
 	}
@@ -51,6 +70,8 @@ func main() {
 	mux.HandleFunc("POST /order", requireAllowedOrigin(handlePlaceOrder(eng, hub, wal)))
 	mux.HandleFunc("DELETE /order", requireAllowedOrigin(handleCancelOrder(eng, hub, wal)))
 	mux.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
+	mux.HandleFunc("GET /trades", handleGetTrades(eng, hub))
+	mux.HandleFunc("GET /orders", handleGetOrders(eng))
 	mux.HandleFunc("/ws", handleWebSocket(hub))
 	mux.HandleFunc("POST /simulator/toggle", requireAllowedOrigin(func(w http.ResponseWriter, r *http.Request) {
 		running := sim.Toggle()
@@ -61,7 +82,7 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"running": sim.IsRunning()})
 	})
-	mux.Handle("/", http.FileServer(http.Dir("./public")))
+	mux.Handle("/", http.FileServer(http.Dir(resolvePublicDir())))
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}
 
@@ -121,8 +142,10 @@ func isJSONRequest(r *http.Request) bool {
 func writeEngineError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	switch {
-	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrUnknownSymbol):
+	case errors.Is(err, engine.ErrInvalidOrder):
 		status = http.StatusBadRequest
+	case errors.Is(err, engine.ErrUnknownSymbol):
+		status = http.StatusNotFound
 	case errors.Is(err, engine.ErrDuplicateOrderID):
 		status = http.StatusConflict
 	case errors.Is(err, engine.ErrOrderNotFound):
@@ -138,13 +161,14 @@ func writeEngineError(w http.ResponseWriter, err error) {
 func publishOrderEvents(hub *Hub, symbol string) func([]*engine.Trade, bool) {
 	return func(trades []*engine.Trade, rested bool) {
 		if len(trades) > 0 {
+			hub.RecordTrades(symbol, trades)
 			hub.BroadcastJSON(map[string]interface{}{
 				"type":   "trades",
 				"symbol": symbol,
 				"data":   trades,
 			})
 		}
-		if rested {
+		if len(trades) > 0 || rested {
 			hub.BroadcastJSON(map[string]interface{}{
 				"type":   "book_update",
 				"symbol": symbol,
@@ -184,6 +208,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
 			return
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1MB max payload
 
 		var order engine.Order
 		if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
@@ -197,7 +222,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			return
 		}
 		order.ID = eng.NextOrderID()
-		order.Timestamp = time.Now().UnixNano()
+		order.Timestamp = time.Now().UnixMilli()
 
 		submitted := order // snapshot before matching mutates Amount
 		trades, err := eng.ProcessOrderWithWALNotify(&order, wal, publishOrderEvents(hub, order.Symbol))
@@ -247,9 +272,14 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 		symbol := r.URL.Query().Get("symbol")
 		idStr := r.URL.Query().Get("id")
 
-		orderID, err := strconv.ParseUint(idStr, 10, 64)
-		if err != nil || symbol == "" {
+		if symbol == "" || idStr == "" {
 			http.Error(w, "query params 'symbol' and 'id' are required", http.StatusBadRequest)
+			return
+		}
+
+		orderID, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil || orderID == 0 {
+			http.Error(w, "query param 'id' must be a positive integer", http.StatusBadRequest)
 			return
 		}
 
@@ -258,6 +288,10 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 				"type":     "order_cancelled",
 				"symbol":   symbol,
 				"order_id": orderID,
+			})
+			hub.BroadcastJSON(map[string]interface{}{
+				"type":   "book_update",
+				"symbol": symbol,
 			})
 		})
 		if err != nil {
@@ -277,6 +311,10 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 func handleGetOrderBook(eng *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
+		if symbol == "" {
+			http.Error(w, "query param 'symbol' is required", http.StatusBadRequest)
+			return
+		}
 		ob, exists := eng.GetOrderBook(symbol)
 		if !exists {
 			http.Error(w, "symbol not found", http.StatusNotFound)
@@ -288,6 +326,53 @@ func handleGetOrderBook(eng *engine.Engine) http.HandlerFunc {
 			"symbol": symbol,
 			"bids":   bids,
 			"asks":   asks,
+		})
+	}
+}
+
+// handleGetTrades returns recent trade executions for GET /trades?symbol=AAPL
+func handleGetTrades(eng *engine.Engine, hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		symbol := r.URL.Query().Get("symbol")
+		if symbol == "" {
+			http.Error(w, "query param 'symbol' is required", http.StatusBadRequest)
+			return
+		}
+		if _, exists := eng.GetOrderBook(symbol); !exists {
+			http.Error(w, "symbol not found", http.StatusNotFound)
+			return
+		}
+		trades := hub.GetRecentTrades(symbol)
+		if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+			if n, err := strconv.Atoi(limitStr); err == nil && n > 0 && n < len(trades) {
+				trades = trades[len(trades)-n:]
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"symbol": symbol,
+			"trades": trades,
+		})
+	}
+}
+
+// handleGetOrders returns currently resting orders for GET /orders?symbol=AAPL
+func handleGetOrders(eng *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		symbol := r.URL.Query().Get("symbol")
+		if symbol == "" {
+			http.Error(w, "query param 'symbol' is required", http.StatusBadRequest)
+			return
+		}
+		orders, exists := eng.GetOpenOrders(symbol)
+		if !exists {
+			http.Error(w, "symbol not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"symbol": symbol,
+			"orders": orders,
 		})
 	}
 }

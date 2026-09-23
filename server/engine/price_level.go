@@ -35,9 +35,26 @@ func (pl *PriceLevel) AddOrder(order *Order) {
 	pl.Tail = order
 }
 
-// RemoveOrder unlinks an order from anywhere in the queue - O(1)
 func (pl *PriceLevel) RemoveOrder(order *Order) {
-	pl.TotalVolume -= order.Amount
+	if order == nil || pl.Head == nil {
+		return
+	}
+	// Verify order matches this price level and is currently linked in this queue
+	if order.Price != pl.Price {
+		return
+	}
+	if order != pl.Head && (order.Prev == nil || order.Prev.Next != order) {
+		return
+	}
+	if order == pl.Head && order.Prev != nil {
+		return
+	}
+
+	if pl.TotalVolume >= order.Amount {
+		pl.TotalVolume -= order.Amount
+	} else {
+		pl.TotalVolume = 0
+	}
 
 	// If there is an order in front of it, bridge over
 	if order.Prev != nil {

@@ -27,6 +27,7 @@ func setupTestSimulator(t *testing.T) (*MarketSimulator, *engine.Engine, *Hub, *
 
 	cleanup := func() {
 		sim.Stop() // waits for the goroutine to exit before the WAL is closed
+		hub.Stop()
 		wal.Close()
 		os.Remove(walPath)
 	}
@@ -187,3 +188,53 @@ func TestSimulatorRefillsEmptySide(t *testing.T) {
 		t.Fatalf("refilled asks must not cross the book: bid=%d ask=%d", bid, ask)
 	}
 }
+
+func TestSimulatorNarrowsWideSpread(t *testing.T) {
+	sim, eng, _, wal, cleanup := setupTestSimulator(t)
+	defer cleanup()
+	eng.RegisterSymbol("AAPL")
+
+	ob, _ := eng.GetOrderBook("AAPL")
+	// Seed a very wide spread: bid at 14000, ask at 16000 (spread = 2000, step = 10)
+	ob.ProcessOrderWithWAL(&engine.Order{
+		ID:        1,
+		Symbol:    "AAPL",
+		Side:      engine.Buy,
+		Type:      engine.Limit,
+		Price:     14000,
+		Amount:    10,
+		Timestamp: time.Now().UnixMilli(),
+	}, wal)
+	ob.ProcessOrderWithWAL(&engine.Order{
+		ID:        2,
+		Symbol:    "AAPL",
+		Side:      engine.Sell,
+		Type:      engine.Limit,
+		Price:     16000,
+		Amount:    10,
+		Timestamp: time.Now().UnixMilli(),
+	}, wal)
+	eng.SetMinOrderID(2)
+
+	// Execute several simulation steps
+	for i := 0; i < 20; i++ {
+		sim.step()
+	}
+
+	bid, hasBid, ask, hasAsk := ob.TopOfBook()
+	if !hasBid || !hasAsk {
+		t.Fatalf("expected both bid and ask to exist")
+	}
+	// Spread should have tightened within the 14000-16000 corridor without widening further
+	if bid < 14000 {
+		t.Fatalf("best bid widened beyond initial 14000: %d", bid)
+	}
+	if ask > 16000 {
+		t.Fatalf("best ask widened beyond initial 16000: %d", ask)
+	}
+	spread := ask - bid
+	if spread >= 2000 {
+		t.Fatalf("expected spread to narrow from 2000, got spread=%d (bid=%d, ask=%d)", spread, bid, ask)
+	}
+}
+

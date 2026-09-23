@@ -7,8 +7,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/divya-3005/OME/server/engine"
 	"github.com/gorilla/websocket"
 )
 
@@ -32,7 +34,12 @@ func isAllowedOrigin(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	if u.Host == r.Host || u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" {
+	if u.Host == r.Host {
+		return true
+	}
+	isLocalHost := r.Host == "localhost" || strings.HasPrefix(r.Host, "localhost:") ||
+		r.Host == "127.0.0.1" || strings.HasPrefix(r.Host, "127.0.0.1:")
+	if isLocalHost && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1") {
 		return true
 	}
 	if allowed := os.Getenv("ALLOWED_ORIGINS"); allowed != "" {
@@ -68,6 +75,10 @@ func (c *Client) readPump() {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
+	c.conn.SetPingHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
 	for {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
@@ -87,8 +98,11 @@ func (c *Client) writePump() {
 		case message, ok := <-c.send:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// Hub closed the channel
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				// Hub closed the channel: write close frame from the dedicated writer goroutine
+				_ = c.conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "connection closed"),
+				)
 				return
 			}
 			// Exactly one JSON event per WebSocket frame.
@@ -111,18 +125,23 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	stop       chan struct{}
+	stopOnce   sync.Once
 	done       chan struct{}
+
+	tradesMu     sync.RWMutex
+	recentTrades map[string][]*engine.Trade
 }
 
 // NewHub creates a new Hub instance
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 1024),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		stop:       make(chan struct{}),
-		done:       make(chan struct{}),
+		clients:      make(map[*Client]bool),
+		broadcast:    make(chan []byte, 1024),
+		register:     make(chan *Client),
+		unregister:   make(chan *Client),
+		stop:         make(chan struct{}),
+		done:         make(chan struct{}),
+		recentTrades: make(map[string][]*engine.Trade),
 	}
 }
 
@@ -133,12 +152,6 @@ func (h *Hub) Run() {
 		select {
 		case <-h.stop:
 			for client := range h.clients {
-				client.conn.SetWriteDeadline(time.Now().Add(writeWait))
-				_ = client.conn.WriteMessage(
-					websocket.CloseMessage,
-					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "server shutting down"),
-				)
-				client.conn.Close()
 				close(client.send)
 				delete(h.clients, client)
 			}
@@ -169,12 +182,9 @@ func (h *Hub) Run() {
 
 // Stop cleanly notifies and closes all connected clients, terminating the hub loop.
 func (h *Hub) Stop() {
-	select {
-	case <-h.stop:
-		return
-	default:
+	h.stopOnce.Do(func() {
 		close(h.stop)
-	}
+	})
 	<-h.done
 }
 
@@ -194,4 +204,34 @@ func (h *Hub) BroadcastJSON(v interface{}) {
 	default:
 		log.Printf("hub: broadcast queue full (%d), dropping event to protect engine throughput", cap(h.broadcast))
 	}
+}
+
+// RecordTrades appends executed trades to the symbol's in-memory trade history buffer.
+func (h *Hub) RecordTrades(symbol string, trades []*engine.Trade) {
+	if len(trades) == 0 {
+		return
+	}
+	h.tradesMu.Lock()
+	defer h.tradesMu.Unlock()
+
+	list := h.recentTrades[symbol]
+	list = append(list, trades...)
+	if len(list) > 200 {
+		list = list[len(list)-200:]
+	}
+	h.recentTrades[symbol] = list
+}
+
+// GetRecentTrades returns a copy of the recent trades recorded for a symbol.
+func (h *Hub) GetRecentTrades(symbol string) []*engine.Trade {
+	h.tradesMu.RLock()
+	defer h.tradesMu.RUnlock()
+
+	list := h.recentTrades[symbol]
+	if len(list) == 0 {
+		return []*engine.Trade{}
+	}
+	res := make([]*engine.Trade, len(list))
+	copy(res, list)
+	return res
 }

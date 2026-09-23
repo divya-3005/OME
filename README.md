@@ -45,9 +45,8 @@ graph TD
     OB1 -->|Append + fsync| WAL["Write-Ahead Log (wal.log)"]
     OB2 -->|Append + fsync| WAL
     OB3 -->|Append + fsync| WAL
-    OB1 -->|Trades / book updates| WSHub
-    OB2 -->|Trades / book updates| WSHub
-    OB3 -->|Trades / book updates| WSHub
+    API -.->|Trades / book updates| WSHub
+    Sim -.->|Trades / book updates| WSHub
     WSHub -->|One JSON event per frame| Client
 ```
 
@@ -61,7 +60,7 @@ graph TD
 
 ### 2. $O(1)$ Order Lookup by ID & Unified ID Namespace
 - **Instant Cancellations**: An internal `Orders map[uint64]*Order` enables instant O(1) order lookup by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
-- **Unified ID Namespace & Reconciliation**: Order IDs are always assigned by the server (`eng.NextOrderID()`), and requests that include an `id` are rejected with 400. After WAL recovery the generator is advanced past the highest recovered ID (`SetMinOrderID`).
+- **Unified ID Namespace & Reconciliation**: Order IDs are always assigned sequentially by the server (`eng.NextOrderID()`), and requests that include an `id` are rejected with 400. After WAL recovery the generator is advanced to the highest recovered ID (`SetMinOrderID`), ensuring subsequent order IDs monotonically increase above all recovered and previously assigned IDs without collisions.
 
 ### 3. Fine-Grained Concurrency & Non-Blocking Hub
 - **Per-Symbol Synchronization**: Each `OrderBook` is protected by its own `sync.RWMutex`. This eliminates cross-symbol lock contention, allowing concurrent matching across distinct asset pairs (`AAPL`, `TSLA`, `BTC-USD`).
@@ -105,6 +104,9 @@ graph TD
 
 ## 🚀 Getting Started
 
+### Prerequisites
+- **Go 1.22 or later** is required (the HTTP router uses method-based patterns introduced in Go 1.22).
+
 ### 1. Run the Server & Trading Terminal
 ```bash
 cd server
@@ -134,10 +136,10 @@ go test -bench=. -benchmem -run=^$ ./...
 
 | Status Code | Reason |
 | :--- | :--- |
-| `400 Bad Request` | Invalid order payload, unknown symbol (`POST /order`, `DELETE /order`), or client-supplied `id` |
+| `400 Bad Request` | Invalid order payload, missing required query params (`symbol`, `id`), client-supplied `id`, or payload > 1MB |
 | `403 Forbidden` | Origin header not allowed (state-changing browser requests) |
-| `404 Not Found` | Symbol not found (`GET /orderbook`) or order ID not found for cancellation (`DELETE /order`) |
-| `409 Conflict` | Duplicate order ID (internal safeguard) |
+| `404 Not Found` | Unknown symbol, or order ID not found for cancellation (`DELETE /order`) |
+| `409 Conflict` | Duplicate order ID (internal engine safeguard) |
 | `415 Unsupported Media Type` | Content-Type is not `application/json` on `POST /order` |
 | `503 Service Unavailable` | Write-Ahead Log (WAL) failure / append rejected |
 
@@ -179,5 +181,17 @@ curl "http://localhost:8080/orderbook?symbol=AAPL"
 curl -X DELETE "http://localhost:8080/order?symbol=AAPL&id=1"
 ```
 
-### 4. Real-Time WebSocket Stream
-Connect to `ws://localhost:8080/ws`. Receives one JSON object per frame: `trades` (`data` = array of trades), `book_update` (a limit order rested; refetch `/orderbook`), and `order_cancelled`.
+### 4. View Recent Trades
+`GET /trades?symbol=AAPL&limit=50`
+```bash
+curl "http://localhost:8080/trades?symbol=AAPL&limit=50"
+```
+
+### 5. View Open Resting Orders
+`GET /orders?symbol=AAPL`
+```bash
+curl "http://localhost:8080/orders?symbol=AAPL"
+```
+
+### 6. Real-Time WebSocket Stream
+Connect to `ws://localhost:8080/ws`. Receives one JSON object per frame: `trades` (`data` = array of trades), `book_update` (liquidity or depth changed; refetch `/orderbook`), and `order_cancelled`.

@@ -19,5 +19,4 @@ bin/
 *.swo
 .DS_Store
 *.log
-wal.log
 server/server

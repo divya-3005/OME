@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/divya-3005/OME/server/engine"
 )
@@ -164,8 +165,8 @@ func TestHandlePlaceOrder(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for unknown symbol, got %d", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown symbol, got %d", rec.Code)
 	}
 }
 
@@ -460,3 +461,281 @@ func TestPlaceOrderWALFailureReturns503(t *testing.T) {
 		t.Fatalf("expected 503 on WAL failure, got %d", rec.Code)
 	}
 }
+
+func TestPlaceOrderRejectsOversizedPayload(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	huge := strings.Repeat("x", 2*1024*1024)
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","pad":"`+huge+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handlePlaceOrder(eng, hub, wal)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for oversized body, got %d", rec.Code)
+	}
+}
+
+func TestGetOrderBookRequiresSymbol(t *testing.T) {
+	eng, _, _, cleanup := setupTestServer(t)
+	defer cleanup()
+	req := httptest.NewRequest("GET", "/orderbook", nil)
+	rec := httptest.NewRecorder()
+	handleGetOrderBook(eng)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing symbol param, got %d", rec.Code)
+	}
+}
+
+func TestOriginCheckRejectsLocalhostOnRemoteHost(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	h := requireAllowedOrigin(handlePlaceOrder(eng, hub, wal))
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":1,"amount":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://localhost:3000")
+	req.Host = "production-exchange.com"
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when localhost origin attacks remote host, got %d", rec.Code)
+	}
+}
+
+func TestPublishOrderEventsBroadcastsBookUpdateOnMatch(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	defer hub.Stop()
+
+	client := &Client{
+		hub:  hub,
+		send: make(chan []byte, 10),
+	}
+	hub.register <- client
+	time.Sleep(10 * time.Millisecond)
+
+	fn := publishOrderEvents(hub, "AAPL")
+	// Simulate market sweep (trades occurred, rested = false)
+	trades := []*engine.Trade{
+		{Symbol: "AAPL", Amount: 5, Price: 15000},
+	}
+	fn(trades, false)
+
+	// We should receive 2 messages: trades AND book_update
+	receivedTrades := false
+	receivedBookUpdate := false
+	timeout := time.After(500 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-client.send:
+			var m map[string]interface{}
+			json.Unmarshal(msg, &m)
+			if m["type"] == "trades" {
+				receivedTrades = true
+			}
+			if m["type"] == "book_update" {
+				receivedBookUpdate = true
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for events (trades=%v, book_update=%v)", receivedTrades, receivedBookUpdate)
+		}
+	}
+	if !receivedTrades || !receivedBookUpdate {
+		t.Fatalf("expected both trades and book_update, got trades=%v, book_update=%v", receivedTrades, receivedBookUpdate)
+	}
+}
+
+func TestHandleGetTrades(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Missing symbol -> 400
+	req := httptest.NewRequest("GET", "/trades", nil)
+	rec := httptest.NewRecorder()
+	handleGetTrades(eng, hub)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing symbol, got %d", rec.Code)
+	}
+
+	// 2. Unknown symbol -> 404
+	req = httptest.NewRequest("GET", "/trades?symbol=UNKNOWN", nil)
+	rec = httptest.NewRecorder()
+	handleGetTrades(eng, hub)(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown symbol, got %d", rec.Code)
+	}
+
+	// 3. Known symbol with trades
+	placeHandler := handlePlaceOrder(eng, hub, wal)
+	// Resting ask
+	req = httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":1,"type":0,"price":15000,"amount":10}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	placeHandler(rec, req)
+
+	// Matching buy
+	req = httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":5}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	placeHandler(rec, req)
+
+	// Query /trades
+	req = httptest.NewRequest("GET", "/trades?symbol=AAPL&limit=10", nil)
+	rec = httptest.NewRecorder()
+	handleGetTrades(eng, hub)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /trades, got %d", rec.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode /trades response: %v", err)
+	}
+	trades := resp["trades"].([]interface{})
+	if len(trades) != 1 {
+		t.Fatalf("expected 1 trade in /trades response, got %d", len(trades))
+	}
+}
+
+func TestHandleGetOrders(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// 1. Missing symbol -> 400
+	req := httptest.NewRequest("GET", "/orders", nil)
+	rec := httptest.NewRecorder()
+	handleGetOrders(eng)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing symbol, got %d", rec.Code)
+	}
+
+	// 2. Unknown symbol -> 404
+	req = httptest.NewRequest("GET", "/orders?symbol=UNKNOWN", nil)
+	rec = httptest.NewRecorder()
+	handleGetOrders(eng)(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown symbol, got %d", rec.Code)
+	}
+
+	// 3. Place resting order and fetch /orders
+	placeHandler := handlePlaceOrder(eng, hub, wal)
+	req = httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":14000,"amount":8}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	placeHandler(rec, req)
+
+	req = httptest.NewRequest("GET", "/orders?symbol=AAPL", nil)
+	rec = httptest.NewRecorder()
+	handleGetOrders(eng)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /orders, got %d", rec.Code)
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode /orders response: %v", err)
+	}
+	orders := resp["orders"].([]interface{})
+	if len(orders) != 1 {
+		t.Fatalf("expected 1 resting order in /orders response, got %d", len(orders))
+	}
+}
+
+func TestHandleCancelOrderBroadcastsBothEvents(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	client := &Client{
+		hub:  hub,
+		send: make(chan []byte, 10),
+	}
+	hub.register <- client
+	time.Sleep(10 * time.Millisecond)
+
+	placeHandler := handlePlaceOrder(eng, hub, wal)
+	cancelHandler := handleCancelOrder(eng, hub, wal)
+
+	// Place order
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":14000,"amount":8}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	placeHandler(rec, req)
+
+	var placeResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &placeResp)
+	orderID := uint64(placeResp["order"].(map[string]interface{})["id"].(float64))
+
+	// Drain book_update from placement
+	select {
+	case <-client.send:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Cancel order
+	cancelURL := fmt.Sprintf("/order?symbol=AAPL&id=%d", orderID)
+	req = httptest.NewRequest("DELETE", cancelURL, nil)
+	rec = httptest.NewRecorder()
+	cancelHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for cancel, got %d", rec.Code)
+	}
+
+	// Must receive order_cancelled AND book_update
+	receivedCancelled := false
+	receivedBookUpdate := false
+	timeout := time.After(500 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-client.send:
+			var m map[string]interface{}
+			json.Unmarshal(msg, &m)
+			if m["type"] == "order_cancelled" {
+				receivedCancelled = true
+			}
+			if m["type"] == "book_update" {
+				receivedBookUpdate = true
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for cancel broadcast events (cancelled=%v, book_update=%v)", receivedCancelled, receivedBookUpdate)
+		}
+	}
+
+	if !receivedCancelled || !receivedBookUpdate {
+		t.Fatalf("expected both order_cancelled and book_update, got cancelled=%v, book_update=%v", receivedCancelled, receivedBookUpdate)
+	}
+}
+
+func TestHandleCancelOrderInvalidID(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	cancelHandler := handleCancelOrder(eng, hub, wal)
+
+	// Non-numeric ID
+	req := httptest.NewRequest("DELETE", "/order?symbol=AAPL&id=abc", nil)
+	rec := httptest.NewRecorder()
+	cancelHandler(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-numeric ID, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "positive integer") {
+		t.Fatalf("expected message about positive integer, got %s", rec.Body.String())
+	}
+
+	// Zero ID
+	req = httptest.NewRequest("DELETE", "/order?symbol=AAPL&id=0", nil)
+	rec = httptest.NewRecorder()
+	cancelHandler(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for zero ID, got %d", rec.Code)
+	}
+
+	// Missing ID (only symbol provided)
+	req = httptest.NewRequest("DELETE", "/order?symbol=AAPL", nil)
+	rec = httptest.NewRecorder()
+	cancelHandler(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing ID, got %d", rec.Code)
+	}
+}
+

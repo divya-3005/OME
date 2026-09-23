@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/divya-3005/OME/server/engine"
 	"github.com/gorilla/websocket"
 )
 
@@ -316,3 +317,83 @@ func TestHubStopClosesClients(t *testing.T) {
 		t.Logf("connection closed as expected: %v", err)
 	}
 }
+
+func TestHubStopConcurrentSafe(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	const numGoroutines = 20
+	done := make(chan struct{}, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			hub.Stop()
+			done <- struct{}{}
+		}()
+	}
+
+	for i := 0; i < numGoroutines; i++ {
+		select {
+		case <-done:
+		case <-time.After(1 * time.Second):
+			t.Fatalf("timed out waiting for concurrent hub.Stop() to finish")
+		}
+	}
+}
+
+func TestHubRecentTrades(t *testing.T) {
+	hub := NewHub()
+
+	// Initial fetch on empty hub should return empty slice
+	emptyTrades := hub.GetRecentTrades("AAPL")
+	if len(emptyTrades) != 0 {
+		t.Fatalf("expected 0 trades on empty hub, got %d", len(emptyTrades))
+	}
+
+	// Record 60 trades
+	trades := make([]*engine.Trade, 60)
+	for i := 0; i < 60; i++ {
+		trades[i] = &engine.Trade{
+			Symbol:    "AAPL",
+			Price:     uint64(15000 + i),
+			Amount:    uint64(i + 1),
+			Timestamp: int64(1000 + i),
+		}
+	}
+	hub.RecordTrades("AAPL", trades)
+
+	// Fetch trades
+	allTrades := hub.GetRecentTrades("AAPL")
+	if len(allTrades) != 60 {
+		t.Fatalf("expected 60 trades, got %d", len(allTrades))
+	}
+	// Verify it contains the latest trade (index 59)
+	if allTrades[59].Price != 15059 {
+		t.Fatalf("expected latest trade price 15059, got %d", allTrades[59].Price)
+	}
+
+	// Record 160 more trades (total 220, buffer capped at 200)
+	moreTrades := make([]*engine.Trade, 160)
+	for i := 0; i < 160; i++ {
+		moreTrades[i] = &engine.Trade{
+			Symbol:    "AAPL",
+			Price:     uint64(16000 + i),
+			Amount:    1,
+			Timestamp: int64(2000 + i),
+		}
+	}
+	hub.RecordTrades("AAPL", moreTrades)
+
+	cappedTrades := hub.GetRecentTrades("AAPL")
+	if len(cappedTrades) != 200 {
+		t.Fatalf("expected trades capped at 200, got %d", len(cappedTrades))
+	}
+
+	// Verify symbol isolation
+	tslaTrades := hub.GetRecentTrades("TSLA")
+	if len(tslaTrades) != 0 {
+		t.Fatalf("expected 0 trades for TSLA, got %d", len(tslaTrades))
+	}
+}
+
+

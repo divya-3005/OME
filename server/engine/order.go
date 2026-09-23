@@ -24,7 +24,7 @@ type Order struct {
 	Type      OrderType `json:"type"`      // Limit or Market
 	Price     uint64    `json:"price"`     // In smallest currency unit (ignored for Market orders)
 	Amount    uint64    `json:"amount"`    // Quantity of shares/units
-	Timestamp int64     `json:"timestamp"` // Server-assigned arrival time (ns). Informational only: priority within a price level is arrival order.
+	Timestamp int64     `json:"timestamp"` // Server-assigned arrival time (ms). Informational only: priority within a price level is arrival order.
 	Prev      *Order    `json:"-"`
 	Next      *Order    `json:"-"`
 }

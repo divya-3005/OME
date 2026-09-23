@@ -43,6 +43,10 @@ func (e *Engine) SetMinOrderID(minID uint64) {
 
 // RegisterSymbol creates a new OrderBook for a given symbol
 func (e *Engine) RegisterSymbol(symbol string) *OrderBook {
+	if symbol == "" {
+		return nil
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -103,4 +107,13 @@ func (e *Engine) CancelOrderWithWAL(symbol string, orderID uint64, wal *WAL) (bo
 // CancelOrder cancels an order for a given symbol without WAL
 func (e *Engine) CancelOrder(symbol string, orderID uint64) (bool, error) {
 	return e.CancelOrderWithWAL(symbol, orderID, nil)
+}
+
+// GetOpenOrders retrieves all resting orders for a symbol
+func (e *Engine) GetOpenOrders(symbol string) ([]OpenOrderSummary, bool) {
+	ob, exists := e.GetOrderBook(symbol)
+	if !exists {
+		return nil, false
+	}
+	return ob.GetOpenOrders(), true
 }
