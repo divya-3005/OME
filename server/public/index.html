@@ -22,67 +22,58 @@
       <div class="symbol-tabs" id="symbolTabs">
         <button class="tab-btn active" data-symbol="AAPL">
           <span class="tab-symbol">AAPL</span>
-          <span class="tab-price" id="tabPrice-AAPL">$150.00</span>
+          <span class="tab-price" id="tabPrice-AAPL">—</span>
         </button>
         <button class="tab-btn" data-symbol="TSLA">
           <span class="tab-symbol">TSLA</span>
-          <span class="tab-price" id="tabPrice-TSLA">$240.00</span>
+          <span class="tab-price" id="tabPrice-TSLA">—</span>
         </button>
         <button class="tab-btn" data-symbol="BTC-USD">
           <span class="tab-symbol">BTC-USD</span>
-          <span class="tab-price" id="tabPrice-BTC-USD">$64,000.00</span>
+          <span class="tab-price" id="tabPrice-BTC-USD">—</span>
         </button>
       </div>
     </div>
 
     <!-- Simulator Control & Telemetry -->
     <div class="header-right">
-      <button class="btn-bot active" id="btnToggleBot" title="Toggle Background Market Simulator">
+      <button class="btn-bot" id="btnToggleBot" title="Toggle Background Market Simulator">
         <span class="bot-dot"></span>
-        <span id="botLabel">BOT: ACTIVE</span>
+        <span id="botLabel">BOT: …</span>
       </button>
 
       <button class="btn-audio" id="btnToggleAudio" title="Toggle Trade Sound Chime">
         🔊 AUDIO: ON
       </button>
 
-      <div class="telemetry-pill">
-        <span class="dot green"></span>
-        <span class="telemetry-label">CORE:</span>
-        <span class="telemetry-val">188 ns</span>
-      </div>
-      <div class="telemetry-pill">
-        <span class="telemetry-label">WAL:</span>
-        <span class="telemetry-val text-green">ACTIVE</span>
-      </div>
       <div class="telemetry-pill" id="wsStatus">
-        <span class="dot-pulse"></span>
-        <span class="telemetry-val">WS LIVE</span>
+        <span class="dot" style="background:#f5a623"></span>
+        <span class="telemetry-val">CONNECTING...</span>
       </div>
     </div>
   </header>
 
-  <!-- 24h Ticker Statistics Bar -->
+  <!-- Session Statistics Bar -->
   <div class="ticker-bar">
     <div class="ticker-item">
       <span class="ticker-label">LAST PRICE</span>
-      <span class="ticker-val" id="tickerLastPrice">$150.00</span>
+      <span class="ticker-val" id="tickerLastPrice">—</span>
     </div>
     <div class="ticker-item">
-      <span class="ticker-label">24H CHANGE</span>
-      <span class="ticker-val text-green" id="tickerChange">+1.45%</span>
+      <span class="ticker-label">SESSION CHANGE</span>
+      <span class="ticker-val" id="tickerChange">—</span>
     </div>
     <div class="ticker-item">
-      <span class="ticker-label">24H HIGH</span>
-      <span class="ticker-val" id="tickerHigh">$152.80</span>
+      <span class="ticker-label">SESSION HIGH</span>
+      <span class="ticker-val" id="tickerHigh">—</span>
     </div>
     <div class="ticker-item">
-      <span class="ticker-label">24H LOW</span>
-      <span class="ticker-val" id="tickerLow">$148.50</span>
+      <span class="ticker-label">SESSION LOW</span>
+      <span class="ticker-val" id="tickerLow">—</span>
     </div>
     <div class="ticker-item">
-      <span class="ticker-label">24H VOLUME</span>
-      <span class="ticker-val" id="tickerVolume">1,420,580</span>
+      <span class="ticker-label">SESSION VOLUME</span>
+      <span class="ticker-val" id="tickerVolume">0</span>
     </div>
     <div class="ticker-item">
       <span class="ticker-label">TOTAL TRADES</span>
@@ -188,11 +179,11 @@
 
         <!-- OHLC Live Stats Bar -->
         <div class="ohlc-bar" id="ohlcBar">
-          <span>O: <b id="ohlcOpen">150.00</b></span>
-          <span>H: <b id="ohlcHigh">150.50</b></span>
-          <span>L: <b id="ohlcLow">149.80</b></span>
-          <span>C: <b id="ohlcClose" class="text-green">150.25</b></span>
-          <span>V: <b id="ohlcVol">14.2K</b></span>
+          <span>O: <b id="ohlcOpen">—</b></span>
+          <span>H: <b id="ohlcHigh">—</b></span>
+          <span>L: <b id="ohlcLow">—</b></span>
+          <span>C: <b id="ohlcClose">—</b></span>
+          <span>V: <b id="ohlcVol">—</b></span>
         </div>
       </div>
 
@@ -221,7 +212,7 @@
           <span class="spread-bps" id="spreadBps">(0.0 bps)</span>
         </div>
         <div class="spread-right" id="lastTradedPrice">
-          $150.00
+          —
         </div>
       </div>
 

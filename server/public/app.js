@@ -2,6 +2,12 @@
 // OME // Institutional Trading Terminal Controller & Dual-Chart Engine (v2.0)
 // ==========================================================================
 
+const SYMBOLS = ['AAPL', 'TSLA', 'BTC-USD'];
+
+function emptyStats() {
+  return { high: null, low: null, volume: 0, tradesCount: 0, openPrice: null, lastPrice: null };
+}
+
 const state = {
   activeSymbol: 'AAPL',
   activeChartTab: 'price', // 'price' | 'depth'
@@ -10,15 +16,16 @@ const state = {
   myOrders: [],
   ws: null,
   audioEnabled: true,
-  botRunning: true,
-  statsBySymbol: {
-    'AAPL':    { high: 152.80,   low: 148.50,   volume: 1420580, tradesCount: 0, openPrice: 147.85,    lastPrice: 147.85 },
-    'TSLA':    { high: 245.50,   low: 238.10,   volume: 0,       tradesCount: 0, openPrice: 242.00,    lastPrice: 242.00 },
-    'BTC-USD': { high: 64800.00, low: 62900.00, volume: 0,       tradesCount: 0, openPrice: 63200.00, lastPrice: 63200.00 },
-  },
+  botRunning: false, // synced from /simulator/status on load
+  // Session statistics, built only from trades received in this browser session.
+  statsBySymbol: Object.fromEntries(SYMBOLS.map(s => [s, emptyStats()])),
+  recentTrades: Object.fromEntries(SYMBOLS.map(s => [s, []])),
+  // Maker fills seen over WS for orders not yet in myOrders (POST response still in flight).
+  earlyMakerFills: new Map(),
+  bookRequestId: 0,
   lastBook: { bids: [], asks: [] },
-  hoverPriceChart: null, // { x, y } when mouse is over price canvas
-  hoverDepthChart: null, // { x, y } when mouse is over depth canvas
+  hoverPriceChart: null,
+  hoverDepthChart: null,
 };
 
 // DOM Elements
@@ -68,98 +75,61 @@ const tickerVolume = document.getElementById('tickerVolume');
 const tickerTradesCount = document.getElementById('tickerTradesCount');
 
 // --------------------------------------------------------------------------
-// 1. Candlestick Data Store & Historical Seeder
+// 1. Candlestick Data Store & Live Time-Bucketed Updates
 // --------------------------------------------------------------------------
-const CANDLE_PERIOD_MS = 15000; // 15-second candle resolution for live action
-const candles = {
-  'AAPL': [],
-  'TSLA': [],
-  'BTC-USD': [],
-};
+const CANDLE_PERIOD_MS = 15000; // 15-second candles
+const MAX_CANDLES = 80;
+const candles = Object.fromEntries(SYMBOLS.map(s => [s, []]));
 
-function seedHistoricalCandles(symbol, basePrice, volatility, count = 48) {
-  const list = [];
-  let currentPrice = basePrice;
-  const now = Date.now();
-  const startTime = now - count * CANDLE_PERIOD_MS;
-
-  for (let i = 0; i < count; i++) {
-    const time = startTime + i * CANDLE_PERIOD_MS;
-    const change = (Math.random() - 0.49) * volatility;
-    const open = currentPrice;
-    const close = Math.max(open + change, basePrice * 0.5);
-    const high = Math.max(open, close) + Math.random() * (volatility * 0.7);
-    const low = Math.min(open, close) - Math.random() * (volatility * 0.7);
-    const volume = Math.floor(Math.random() * 8000) + 1200;
-
-    list.push({
-      time,
-      open: parseFloat(open.toFixed(2)),
-      high: parseFloat(high.toFixed(2)),
-      low: parseFloat(low.toFixed(2)),
-      close: parseFloat(close.toFixed(2)),
-      volume,
-    });
-
-    currentPrice = close;
-  }
-  return list;
-}
-
-// Initialize seed data
-candles['AAPL'] = seedHistoricalCandles('AAPL', 150.00, 0.45);
-candles['TSLA'] = seedHistoricalCandles('TSLA', 240.00, 1.20);
-candles['BTC-USD'] = seedHistoricalCandles('BTC-USD', 64000.00, 150.00);
-
-function updateCandleOnTrade(symbol, price, amount) {
+function updateCandleOnTrade(symbol, price, amount, tsMs) {
   const list = candles[symbol];
-  if (!list || list.length === 0) return;
+  if (!list) return;
 
-  const now = Date.now();
+  const bucket = Math.floor(tsMs / CANDLE_PERIOD_MS) * CANDLE_PERIOD_MS;
   const last = list[list.length - 1];
 
-  if (now - last.time > CANDLE_PERIOD_MS) {
-    // Roll into new candle
-    list.push({
-      time: now,
-      open: last.close,
-      high: Math.max(last.close, price),
-      low: Math.min(last.close, price),
-      close: price,
-      volume: amount,
-    });
-    if (list.length > 80) list.shift();
+  if (!last || bucket > last.time) {
+    // Fill quiet periods with flat candles so the x-axis stays linear in time.
+    if (last) {
+      const firstGap = Math.max(last.time + CANDLE_PERIOD_MS, bucket - MAX_CANDLES * CANDLE_PERIOD_MS);
+      for (let t = firstGap; t < bucket; t += CANDLE_PERIOD_MS) {
+        list.push({ time: t, open: last.close, high: last.close, low: last.close, close: last.close, volume: 0 });
+      }
+    }
+    list.push({ time: bucket, open: price, high: price, low: price, close: price, volume: amount });
+    while (list.length > MAX_CANDLES) list.shift();
   } else {
-    // Update active candle
-    last.high = Math.max(last.high, price);
-    last.low = Math.min(last.low, price);
-    last.close = price;
-    last.volume += amount;
+    const c = list.find(x => x.time === bucket);
+    if (!c) return; // older than the retained window
+    c.high = Math.max(c.high, price);
+    c.low = Math.min(c.low, price);
+    c.volume += amount;
+    if (c === last) c.close = price;
   }
 
-  updateOHLCHeader();
-  if (state.activeChartTab === 'price') {
-    renderPriceChart();
+  if (symbol === state.activeSymbol) {
+    updateOHLCHeader();
+    if (state.activeChartTab === 'price') renderPriceChart();
   }
 }
 
 function updateOHLCHeader(customCandle = null) {
   const list = candles[state.activeSymbol];
-  if (!list || list.length === 0) return;
-  const c = customCandle || list[list.length - 1];
+  const c = customCandle || (list && list[list.length - 1]);
+  if (!c) {
+    [ohlcOpen, ohlcHigh, ohlcLow, ohlcClose, ohlcVol].forEach(el => { if (el) el.textContent = '—'; });
+    if (ohlcClose) ohlcClose.className = '';
+    return;
+  }
 
   ohlcOpen.textContent = c.open.toFixed(2);
   ohlcHigh.textContent = c.high.toFixed(2);
   ohlcLow.textContent = c.low.toFixed(2);
   ohlcClose.textContent = c.close.toFixed(2);
-
-  const isBull = c.close >= c.open;
-  ohlcClose.className = isBull ? 'text-green' : 'text-red';
+  ohlcClose.className = c.close >= c.open ? 'text-green' : 'text-red';
 
   if (ohlcVol) {
-    ohlcVol.textContent = c.volume >= 1000 
-      ? (c.volume / 1000).toFixed(1) + 'K' 
-      : c.volume.toString();
+    ohlcVol.textContent = c.volume >= 1000 ? (c.volume / 1000).toFixed(1) + 'K' : c.volume.toString();
   }
 }
 
@@ -192,7 +162,13 @@ function renderPriceChart() {
   ctx.clearRect(0, 0, width, height);
 
   const list = candles[state.activeSymbol];
-  if (!list || list.length === 0) return;
+  if (!list || list.length === 0) {
+    ctx.fillStyle = '#475569';
+    ctx.font = '11px "Plus Jakarta Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for trades...', width / 2, height / 2);
+    return;
+  }
 
   const rightMargin = 70;
   const bottomMargin = 22;
@@ -210,7 +186,7 @@ function renderPriceChart() {
     if (c.volume > maxVol) maxVol = c.volume;
   });
 
-  // Add 4% padding to price bounds
+  // Add 8% padding to price bounds
   const pricePadding = (maxPrice - minPrice) * 0.08 || 1;
   const pMin = minPrice - pricePadding;
   const pMax = maxPrice + pricePadding;
@@ -265,8 +241,7 @@ function renderPriceChart() {
   ctx.stroke();
 
   // 2. Draw Candlesticks & Volume Bars
-  const numCandles = list.length;
-  const slotW = chartW / numCandles;
+  const slotW = chartW / Math.max(list.length, 40); // fixed minimum slot count keeps candle width sane
   const candleW = Math.max(3, slotW * 0.68);
 
   list.forEach((c, idx) => {
@@ -300,50 +275,29 @@ function renderPriceChart() {
     ctx.fillStyle = color;
     ctx.fillRect(x - candleW / 2, bodyTop, candleW, bodyH);
 
-    // Time Label (Every ~10 candles)
-    if (idx % 10 === 0) {
+    // Bottom time label every 8 candles
+    if (idx % 8 === 0) {
       const timeStr = new Date(c.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      ctx.fillStyle = '#475569';
+      ctx.fillStyle = '#64748b';
+      ctx.font = '9px "JetBrains Mono", monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(timeStr, x, chartH + 15);
+      ctx.fillText(timeStr, x, chartH + 14);
     }
   });
 
-  // 3. Live Price Line & Glowing Badge
-  const lastCandle = list[list.length - 1];
-  const lastY = priceToY(lastCandle.close);
-  const liveColor = lastCandle.close >= lastCandle.open ? '#00f090' : '#ff3358';
-
-  ctx.strokeStyle = liveColor;
-  ctx.setLineDash([4, 4]);
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(0, lastY);
-  ctx.lineTo(chartW, lastY);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // Live Price Badge on Axis
-  const badgeW = 62;
-  const badgeH = 18;
-  ctx.fillStyle = liveColor;
-  ctx.beginPath();
-  ctx.roundRect(chartW + 4, lastY - badgeH / 2, badgeW, badgeH, 3);
-  ctx.fill();
-
-  ctx.fillStyle = '#000000';
-  ctx.font = 'bold 10px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(`$${lastCandle.close.toFixed(2)}`, chartW + 4 + badgeW / 2, lastY + 3.5);
-
-  // 4. Interactive Hover Crosshair
-  if (state.hoverPriceChart) {
+  // 3. Interactive Crosshair & Hover Tooltip
+  if (state.hoverPriceChart && state.hoverPriceChart.x <= chartW && state.hoverPriceChart.y <= chartH) {
     const { x, y } = state.hoverPriceChart;
+    const hoveredIdx = Math.floor(x / slotW);
 
-    if (x <= chartW && y <= chartH) {
+    if (hoveredIdx >= 0 && hoveredIdx < list.length) {
+      const c = list[hoveredIdx];
+      updateOHLCHeader(c);
+
+      // Draw Crosshair Lines
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
-      ctx.setLineDash([3, 3]);
       ctx.lineWidth = 1;
+      ctx.setLineDash([2, 2]);
 
       // Vertical line
       ctx.beginPath();
@@ -358,26 +312,25 @@ function renderPriceChart() {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Price Tag on Right Axis
+      // Floating Price Badge on Right Axis
       const hoverPrice = yToPrice(y);
-      ctx.fillStyle = '#1e293b';
-      ctx.strokeStyle = '#475569';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(chartW + 4, y - badgeH / 2, badgeW, badgeH, 3);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = '#e2e8f0';
+      ctx.fillStyle = '#2563eb';
+      ctx.fillRect(chartW, y - 9, rightMargin, 18);
+      ctx.fillStyle = '#ffffff';
       ctx.font = '10px "JetBrains Mono", monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText(`$${hoverPrice.toFixed(2)}`, chartW + 4 + badgeW / 2, y + 3.5);
+      ctx.textAlign = 'left';
+      ctx.fillText(`$${hoverPrice.toFixed(2)}`, chartW + 8, y + 4);
 
-      // Find hovered candle and update OHLC
-      const hoveredIdx = Math.floor(x / slotW);
-      if (hoveredIdx >= 0 && hoveredIdx < list.length) {
-        updateOHLCHeader(list[hoveredIdx]);
-      }
+      // Floating Time Badge on Bottom Axis
+      const hoverTime = new Date(c.time).toLocaleTimeString();
+      const timeBoxW = 60;
+      ctx.fillStyle = '#1e293b';
+      ctx.fillRect(x - timeBoxW / 2, chartH, timeBoxW, bottomMargin);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+      ctx.strokeRect(x - timeBoxW / 2, chartH, timeBoxW, bottomMargin);
+      ctx.fillStyle = '#94a3b8';
+      ctx.textAlign = 'center';
+      ctx.fillText(hoverTime, x, chartH + 14);
     }
   }
 }
@@ -392,7 +345,10 @@ function drawDepthChart(bids, asks) {
   const { ctx, width, height } = setupCanvasDPI(depthCanvas);
   ctx.clearRect(0, 0, width, height);
 
-  if (bids.length === 0 && asks.length === 0) {
+  const b = state.lastBook.bids.slice(0, 24); // best (highest) first
+  const a = state.lastBook.asks.slice(0, 24); // best (lowest) first
+
+  if (b.length === 0 && a.length === 0) {
     ctx.fillStyle = '#475569';
     ctx.font = '11px "Plus Jakarta Sans", sans-serif';
     ctx.textAlign = 'center';
@@ -400,207 +356,191 @@ function drawDepthChart(bids, asks) {
     return;
   }
 
-  // Cumulative depth preparation
-  let cumBids = [];
-  let totalBid = 0;
-  bids.slice(0, 24).forEach(b => {
-    totalBid += b.volume;
-    cumBids.push({ price: b.price / 100, cum: totalBid, volume: b.volume });
-  });
+  let running = 0;
+  const cumBids = b.map(l => ({ price: l.price / 100, cum: (running += l.volume) }));
+  running = 0;
+  const cumAsks = a.map(l => ({ price: l.price / 100, cum: (running += l.volume) }));
 
-  let cumAsks = [];
-  let totalAsk = 0;
-  asks.slice(0, 24).forEach(a => {
-    totalAsk += a.volume;
-    cumAsks.push({ price: a.price / 100, cum: totalAsk, volume: a.volume });
-  });
+  // Linear price domain covering both sides.
+  const prices = cumBids.concat(cumAsks).map(l => l.price);
+  let lo = Math.min(...prices);
+  let hi = Math.max(...prices);
+  const pad = (hi - lo) * 0.05 || Math.max(hi * 0.001, 0.01);
+  lo -= pad;
+  hi += pad;
 
-  const maxCum = Math.max(totalBid, totalAsk, 100);
-  const midX = width / 2;
   const paddingBottom = 24;
+  const topPad = 14;
   const drawH = height - paddingBottom;
+  const maxCum = Math.max(
+    cumBids.length ? cumBids[cumBids.length - 1].cum : 0,
+    cumAsks.length ? cumAsks[cumAsks.length - 1].cum : 0,
+    1
+  );
+  const xOf = p => ((p - lo) / (hi - lo)) * width;
+  const yOf = c => drawH - (c / maxCum) * (drawH - topPad);
+  const xToPrice = x => lo + (x / width) * (hi - lo);
+  const mid = cumBids.length && cumAsks.length ? (cumBids[0].price + cumAsks[0].price) / 2 : null;
 
-  // 1. Draw Subtle Depth Grid
+  // 1. Grid
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
   ctx.setLineDash([3, 3]);
   ctx.lineWidth = 1;
   ctx.font = '10px "JetBrains Mono", monospace';
   ctx.fillStyle = '#64748b';
-
-  const volSteps = 4;
-  for (let i = 1; i <= volSteps; i++) {
-    const y = drawH - (i / volSteps) * (drawH - 12);
-    const volVal = Math.round((i / volSteps) * maxCum);
-
+  for (let i = 1; i <= 4; i++) {
+    const y = drawH - (i / 4) * (drawH - topPad);
     ctx.beginPath();
     ctx.moveTo(0, y);
     ctx.lineTo(width, y);
     ctx.stroke();
-
     ctx.textAlign = 'left';
-    ctx.fillText(`${volVal.toLocaleString()}`, 8, y - 3);
+    ctx.fillText(Math.round((i / 4) * maxCum).toLocaleString(), 8, y - 3);
   }
   ctx.setLineDash([]);
 
-  // 2. Draw Bids Step-Staircase Curve (Green, Left)
-  if (cumBids.length > 0) {
+  // 2. Bids: depth at price p = total bid volume priced >= p
+  if (cumBids.length) {
     ctx.beginPath();
-    ctx.moveTo(midX, drawH);
-
-    // Initial step at best bid
-    const bestBidY = drawH - (cumBids[0].cum / maxCum) * (drawH - 14);
-    ctx.lineTo(midX, bestBidY);
-
-    for (let i = 0; i < cumBids.length; i++) {
-      const nextX = midX - ((i + 1) / cumBids.length) * midX;
-      const currentY = drawH - (cumBids[i].cum / maxCum) * (drawH - 14);
-
-      // Horizontal step to price level
-      ctx.lineTo(nextX, currentY);
-
-      // Vertical step to next cumulative depth if available
-      if (i < cumBids.length - 1) {
-        const nextY = drawH - (cumBids[i + 1].cum / maxCum) * (drawH - 14);
-        ctx.lineTo(nextX, nextY);
-      }
+    ctx.moveTo(xOf(cumBids[0].price), drawH);
+    ctx.lineTo(xOf(cumBids[0].price), yOf(cumBids[0].cum));
+    for (let i = 1; i < cumBids.length; i++) {
+      const x = xOf(cumBids[i].price);
+      ctx.lineTo(x, yOf(cumBids[i - 1].cum));
+      ctx.lineTo(x, yOf(cumBids[i].cum));
     }
-
+    ctx.lineTo(0, yOf(cumBids[cumBids.length - 1].cum));
     ctx.lineTo(0, drawH);
     ctx.closePath();
-
-    // Gradient fill
     const bidGrad = ctx.createLinearGradient(0, 0, 0, drawH);
     bidGrad.addColorStop(0, 'rgba(0, 240, 144, 0.28)');
     bidGrad.addColorStop(1, 'rgba(0, 240, 144, 0.01)');
     ctx.fillStyle = bidGrad;
     ctx.fill();
-
-    // Step border stroke
     ctx.strokeStyle = '#00f090';
     ctx.lineWidth = 2;
     ctx.stroke();
   }
 
-  // 3. Draw Asks Step-Staircase Curve (Red, Right)
-  if (cumAsks.length > 0) {
+  // 3. Asks: depth at price p = total ask volume priced <= p
+  if (cumAsks.length) {
     ctx.beginPath();
-    ctx.moveTo(midX, drawH);
-
-    // Initial step at best ask
-    const bestAskY = drawH - (cumAsks[0].cum / maxCum) * (drawH - 14);
-    ctx.lineTo(midX, bestAskY);
-
-    for (let i = 0; i < cumAsks.length; i++) {
-      const nextX = midX + ((i + 1) / cumAsks.length) * midX;
-      const currentY = drawH - (cumAsks[i].cum / maxCum) * (drawH - 14);
-
-      // Horizontal step to price level
-      ctx.lineTo(nextX, currentY);
-
-      // Vertical step to next cumulative depth if available
-      if (i < cumAsks.length - 1) {
-        const nextY = drawH - (cumAsks[i + 1].cum / maxCum) * (drawH - 14);
-        ctx.lineTo(nextX, nextY);
-      }
+    ctx.moveTo(xOf(cumAsks[0].price), drawH);
+    ctx.lineTo(xOf(cumAsks[0].price), yOf(cumAsks[0].cum));
+    for (let i = 1; i < cumAsks.length; i++) {
+      const x = xOf(cumAsks[i].price);
+      ctx.lineTo(x, yOf(cumAsks[i - 1].cum));
+      ctx.lineTo(x, yOf(cumAsks[i].cum));
     }
-
+    ctx.lineTo(width, yOf(cumAsks[cumAsks.length - 1].cum));
     ctx.lineTo(width, drawH);
     ctx.closePath();
-
-    // Gradient fill
     const askGrad = ctx.createLinearGradient(0, 0, 0, drawH);
     askGrad.addColorStop(0, 'rgba(255, 51, 88, 0.28)');
     askGrad.addColorStop(1, 'rgba(255, 51, 88, 0.01)');
     ctx.fillStyle = askGrad;
     ctx.fill();
-
-    // Step border stroke
     ctx.strokeStyle = '#ff3358';
     ctx.lineWidth = 2;
     ctx.stroke();
   }
 
-  // 4. Center Mid-Market Line
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-  ctx.setLineDash([3, 3]);
-  ctx.beginPath();
-  ctx.moveTo(midX, 0);
-  ctx.lineTo(midX, drawH);
-  ctx.stroke();
-  ctx.setLineDash([]);
+  // 4. Mid-market line at its true price position
+  if (mid !== null) {
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(xOf(mid), 0);
+    ctx.lineTo(xOf(mid), drawH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
 
-  // 5. Price Axis at Bottom
-  ctx.fillStyle = '#64748b';
+  // 5. Price axis: edges and mid, at their real positions
   ctx.font = '10px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-
-  if (cumBids.length > 0) {
-    const deepestBid = cumBids[cumBids.length - 1].price;
-    const bestBid = cumBids[0].price;
-    ctx.fillText(`$${deepestBid.toFixed(2)}`, 30, height - 8);
-    ctx.fillText(`$${bestBid.toFixed(2)}`, midX - 45, height - 8);
+  ctx.fillStyle = '#64748b';
+  ctx.textAlign = 'left';
+  ctx.fillText(`$${xToPrice(0).toFixed(2)}`, 4, height - 8);
+  ctx.textAlign = 'right';
+  ctx.fillText(`$${xToPrice(width).toFixed(2)}`, width - 4, height - 8);
+  if (mid !== null) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.textAlign = 'center';
+    ctx.fillText(`MID $${mid.toFixed(2)}`, xOf(mid), height - 8);
   }
 
-  ctx.fillStyle = '#94a3b8';
-  ctx.fillText('MID SPREAD', midX, height - 8);
-
-  if (cumAsks.length > 0) {
-    const bestAsk = cumAsks[0].price;
-    const deepestAsk = cumAsks[cumAsks.length - 1].price;
-    ctx.fillStyle = '#64748b';
-    ctx.fillText(`$${bestAsk.toFixed(2)}`, midX + 45, height - 8);
-    ctx.fillText(`$${deepestAsk.toFixed(2)}`, width - 35, height - 8);
-  }
-
-  // 6. Interactive Depth Hover Tooltip
-  if (state.hoverDepthChart) {
+  // 6. Hover tooltip: cumulative depth available up to the hovered price
+  if (state.hoverDepthChart && state.hoverDepthChart.y <= drawH) {
     const { x, y } = state.hoverDepthChart;
-    if (y <= drawH) {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-      ctx.setLineDash([2, 2]);
+    const p = xToPrice(x);
+    const onBidSide = mid !== null ? p <= mid : cumBids.length > 0;
+    let text = '';
+    if (onBidSide) {
+      const lv = cumBids.filter(l => l.price >= p);
+      if (lv.length) text = `BIDS ≥ $${p.toFixed(2)} | DEPTH: ${lv[lv.length - 1].cum.toLocaleString()}`;
+    } else {
+      const lv = cumAsks.filter(l => l.price <= p);
+      if (lv.length) text = `ASKS ≤ $${p.toFixed(2)} | DEPTH: ${lv[lv.length - 1].cum.toLocaleString()}`;
+    }
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, drawH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (text) {
+      const txtW = ctx.measureText(text).width + 16;
+      const boxX = Math.max(10, Math.min(width - txtW - 10, x - txtW / 2));
+      const boxY = Math.max(10, y - 28);
+      ctx.fillStyle = '#0f172a';
+      ctx.strokeStyle = onBidSide ? '#00f090' : '#ff3358';
+      ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, drawH);
+      ctx.roundRect(boxX, boxY, txtW, 20, 4);
+      ctx.fill();
       ctx.stroke();
-      ctx.setLineDash([]);
-
-      const isBid = x < midX;
-      let depthText = '';
-      if (isBid && cumBids.length > 0) {
-        const idx = Math.min(Math.floor(((midX - x) / midX) * cumBids.length), cumBids.length - 1);
-        const item = cumBids[idx];
-        depthText = `BID: $${item.price.toFixed(2)} | DEPTH: ${item.cum.toLocaleString()}`;
-      } else if (!isBid && cumAsks.length > 0) {
-        const idx = Math.min(Math.floor(((x - midX) / midX) * cumAsks.length), cumAsks.length - 1);
-        const item = cumAsks[idx];
-        depthText = `ASK: $${item.price.toFixed(2)} | DEPTH: ${item.cum.toLocaleString()}`;
-      }
-
-      if (depthText) {
-        ctx.font = '10px "JetBrains Mono", monospace';
-        const txtW = ctx.measureText(depthText).width + 16;
-        const boxX = Math.max(10, Math.min(width - txtW - 10, x - txtW / 2));
-        const boxY = Math.max(10, y - 28);
-
-        ctx.fillStyle = '#0f172a';
-        ctx.strokeStyle = isBid ? '#00f090' : '#ff3358';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.roundRect(boxX, boxY, txtW, 20, 4);
-        ctx.fill();
-        ctx.stroke();
-
-        ctx.fillStyle = '#f8fafc';
-        ctx.textAlign = 'center';
-        ctx.fillText(depthText, boxX + txtW / 2, boxY + 13.5);
-      }
+      ctx.fillStyle = '#f8fafc';
+      ctx.textAlign = 'center';
+      ctx.fillText(text, boxX + txtW / 2, boxY + 13.5);
     }
   }
 }
 
 // --------------------------------------------------------------------------
-// 5. Chart Interaction & Tab Switchers
+// 5. Chart Interaction Listeners (Hover & Tab Switching)
 // --------------------------------------------------------------------------
+priceCanvas.addEventListener('mousemove', (e) => {
+  const rect = priceCanvas.getBoundingClientRect();
+  state.hoverPriceChart = {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  };
+  renderPriceChart();
+});
+
+priceCanvas.addEventListener('mouseleave', () => {
+  state.hoverPriceChart = null;
+  updateOHLCHeader();
+  renderPriceChart();
+});
+
+depthCanvas.addEventListener('mousemove', (e) => {
+  const rect = depthCanvas.getBoundingClientRect();
+  state.hoverDepthChart = {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  };
+  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+});
+
+depthCanvas.addEventListener('mouseleave', () => {
+  state.hoverDepthChart = null;
+  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
+});
+
 tabChartPrice.addEventListener('click', () => {
   state.activeChartTab = 'price';
   tabChartPrice.classList.add('active');
@@ -619,38 +559,6 @@ tabChartDepth.addEventListener('click', () => {
   drawDepthChart(state.lastBook.bids, state.lastBook.asks);
 });
 
-// Price Canvas Mouse Events
-priceCanvas.addEventListener('mousemove', (e) => {
-  const rect = priceCanvas.getBoundingClientRect();
-  state.hoverPriceChart = {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top,
-  };
-  renderPriceChart();
-});
-
-priceCanvas.addEventListener('mouseleave', () => {
-  state.hoverPriceChart = null;
-  updateOHLCHeader();
-  renderPriceChart();
-});
-
-// Depth Canvas Mouse Events
-depthCanvas.addEventListener('mousemove', (e) => {
-  const rect = depthCanvas.getBoundingClientRect();
-  state.hoverDepthChart = {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top,
-  };
-  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
-});
-
-depthCanvas.addEventListener('mouseleave', () => {
-  state.hoverDepthChart = null;
-  drawDepthChart(state.lastBook.bids, state.lastBook.asks);
-});
-
-// Responsive resize listener
 window.addEventListener('resize', () => {
   if (state.activeChartTab === 'price') {
     renderPriceChart();
@@ -666,26 +574,28 @@ let audioCtx = null;
 function playTradeSound() {
   if (!state.audioEnabled) return;
   try {
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
 
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
-
     osc.type = 'sine';
-    osc.frequency.setValueAtTime(880, audioCtx.currentTime); // A5 note
-    osc.frequency.exponentialRampToValueAtTime(1320, audioCtx.currentTime + 0.04);
+    osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1760, audioCtx.currentTime + 0.08);
 
     gain.gain.setValueAtTime(0.04, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.05);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.12);
 
     osc.connect(gain);
     gain.connect(audioCtx.destination);
-
     osc.start();
-    osc.stop(audioCtx.currentTime + 0.05);
+    osc.stop(audioCtx.currentTime + 0.12);
   } catch (e) {
-    // Handled gracefully if browser policy blocks audio before user interaction
+    // Audio context may be restricted before user gesture
   }
 }
 
@@ -701,6 +611,7 @@ function connectWebSocket() {
   state.ws.onopen = () => {
     wsStatus.innerHTML = '<span class="dot-pulse"></span><span class="telemetry-val">WS LIVE</span>';
     fetchOrderBook();
+    syncBotStatus();
   };
 
   state.ws.onmessage = (event) => {
@@ -720,37 +631,45 @@ function connectWebSocket() {
 
 function handleServerEvent(msg) {
   if (msg.type === 'trades') {
-    // Reconcile the user's own resting orders regardless of active tab,
-    // so myOrders never goes stale for symbols not currently in view.
     updateOpenOrdersAfterMatch(msg.data);
-
+    // Record every trade for its own symbol, not just the one on screen.
+    msg.data.forEach(trade => recordTrade(msg.symbol, trade));
     if (msg.symbol === state.activeSymbol) {
-      msg.data.forEach(trade => {
-        appendTrade(trade);
-        const p = trade.price / 100;
-        updateCandleOnTrade(state.activeSymbol, p, trade.amount);
-      });
-      fetchOrderBook();
+      renderTradesStream();
+      renderTickerForActiveSymbol();
+      scheduleBookRefresh();
       playTradeSound();
     }
+  } else if (msg.type === 'book_update') {
+    if (msg.symbol === state.activeSymbol) scheduleBookRefresh();
   } else if (msg.type === 'order_cancelled') {
     state.myOrders = state.myOrders.filter(o => o.id !== msg.order_id);
     renderOpenOrders();
-
-    if (msg.symbol === state.activeSymbol) {
-      fetchOrderBook();
-    }
+    if (msg.symbol === state.activeSymbol) scheduleBookRefresh();
   }
+}
+
+let bookRefreshTimer = null;
+function scheduleBookRefresh() {
+  if (bookRefreshTimer) return;
+  bookRefreshTimer = setTimeout(() => {
+    bookRefreshTimer = null;
+    fetchOrderBook();
+  }, 100);
 }
 
 // --------------------------------------------------------------------------
 // 8. Fetch & Render L2 Order Book
 // --------------------------------------------------------------------------
 async function fetchOrderBook() {
+  const symbol = state.activeSymbol;
+  const requestId = ++state.bookRequestId;
   try {
-    const res = await fetch(`/orderbook?symbol=${state.activeSymbol}`);
+    const res = await fetch(`/orderbook?symbol=${encodeURIComponent(symbol)}`);
     if (!res.ok) return;
     const data = await res.json();
+    // Drop responses superseded by a newer request or a tab switch.
+    if (requestId !== state.bookRequestId || data.symbol !== state.activeSymbol) return;
     renderOrderBook(data);
     drawDepthChart(data.bids || [], data.asks || []);
   } catch (err) {
@@ -774,61 +693,54 @@ function renderOrderBook(data) {
     return { ...b, cum: cumBid };
   });
 
-  const maxTotal = Math.max(cumAsk, cumBid, 1);
+  const maxCum = Math.max(cumAsk, cumBid, 1);
 
-  // Render Asks
-  if (asksWithCum.length === 0) {
-    asksContainer.innerHTML = '<div class="empty-state">No asks resting</div>';
-  } else {
-    asksContainer.innerHTML = asksWithCum.slice(0, 15).reverse().map(a => {
-      const pct = Math.min((a.cum / maxTotal) * 100, 100);
-      const priceFormatted = (a.price / 100).toFixed(2);
-      return `
-        <div class="book-row ask-row" onclick="setPrice('${priceFormatted}')">
-          <div class="book-depth-bar" style="width: ${pct}%"></div>
-          <span class="book-price">${priceFormatted}</span>
-          <span>${a.volume.toLocaleString()}</span>
-          <span>${a.cum.toLocaleString()}</span>
-        </div>
-      `;
-    }).join('');
-  }
+  // Render Asks (reversed so lowest ask is near spread)
+  const displayAsks = [...asksWithCum].reverse();
+  asksContainer.innerHTML = displayAsks.map(a => {
+    const priceFormatted = (a.price / 100).toFixed(2);
+    const depthPct = Math.min(100, Math.round((a.cum / maxCum) * 100));
+    return `
+      <div class="book-row ask-row" onclick="setPrice('${priceFormatted}')">
+        <div class="depth-bar depth-bar-ask" style="width: ${depthPct}%;"></div>
+        <span class="price-val">$${priceFormatted}</span>
+        <span class="size-val">${a.volume.toLocaleString()}</span>
+        <span class="total-val">${a.cum.toLocaleString()}</span>
+      </div>
+    `;
+  }).join('');
 
-  // Render Bids
-  if (bidsWithCum.length === 0) {
-    bidsContainer.innerHTML = '<div class="empty-state">No bids resting</div>';
-  } else {
-    bidsContainer.innerHTML = bidsWithCum.slice(0, 15).map(b => {
-      const pct = Math.min((b.cum / maxTotal) * 100, 100);
-      const priceFormatted = (b.price / 100).toFixed(2);
-      return `
-        <div class="book-row bid-row" onclick="setPrice('${priceFormatted}')">
-          <div class="book-depth-bar" style="width: ${pct}%"></div>
-          <span class="book-price">${priceFormatted}</span>
-          <span>${b.volume.toLocaleString()}</span>
-          <span>${b.cum.toLocaleString()}</span>
-        </div>
-      `;
-    }).join('');
-  }
+  // Render Bids (highest bid near spread)
+  bidsContainer.innerHTML = bidsWithCum.map(b => {
+    const priceFormatted = (b.price / 100).toFixed(2);
+    const depthPct = Math.min(100, Math.round((b.cum / maxCum) * 100));
+    return `
+      <div class="book-row bid-row" onclick="setPrice('${priceFormatted}')">
+        <div class="depth-bar depth-bar-bid" style="width: ${depthPct}%;"></div>
+        <span class="price-val">$${priceFormatted}</span>
+        <span class="size-val">${b.volume.toLocaleString()}</span>
+        <span class="total-val">${b.cum.toLocaleString()}</span>
+      </div>
+    `;
+  }).join('');
 
-  // Calculate Spread
+  // Update Spread Indicator
   if (bids.length > 0 && asks.length > 0) {
     const bestBid = bids[0].price;
     const bestAsk = asks[0].price;
-    const spread = bestAsk - bestBid;
-    const spreadDollars = (spread / 100).toFixed(2);
-    const bps = ((spread / bestAsk) * 10000).toFixed(1);
+    const spreadCents = bestAsk - bestBid;
+    const spreadDollars = (spreadCents / 100).toFixed(2);
+    const midPrice = (bestAsk + bestBid) / 2;
+    const bps = ((spreadCents / midPrice) * 10000).toFixed(1);
 
     spreadValue.textContent = `$${spreadDollars}`;
-    spreadBps.textContent = `(${bps} bps)`;
+    spreadBps.textContent = `${bps} BPS`;
   } else {
-    spreadValue.textContent = '---';
-    spreadBps.textContent = '';
+    spreadValue.textContent = '—';
+    spreadBps.textContent = '—';
   }
 }
 
-// Click-to-fill
 window.setPrice = function(price) {
   if (state.type === 0) {
     inputPrice.value = price;
@@ -837,68 +749,81 @@ window.setPrice = function(price) {
 };
 
 // --------------------------------------------------------------------------
-// 9. Trade Stream & 24h Ticker Updates
+// 9. Trade Stream, Per-Symbol Stats & Ticker Updates
 // --------------------------------------------------------------------------
-function appendTrade(trade) {
-  const price = (trade.price / 100).toFixed(2);
-  const time = new Date(trade.timestamp / 1000000).toLocaleTimeString();
-  const sideClass = trade.side === 0 ? 'buy' : 'sell';
+function formatUSD(p) {
+  return '$' + p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 
-  const row = document.createElement('div');
-  row.className = 'trade-row';
-  row.innerHTML = `
-    <span class="trade-price ${sideClass}">$${price}</span>
-    <span>${trade.amount}</span>
-    <span>${time}</span>
-  `;
+// Returns display text + class for a percentage. Never produces "+-0.00%".
+function formatPct(pct) {
+  if (pct === null || !isFinite(pct)) return { text: '—', cls: 'ticker-val' };
+  const rounded = Math.round(pct * 100) / 100;
+  if (rounded === 0) return { text: '0.00%', cls: 'ticker-val' };
+  return {
+    text: `${rounded > 0 ? '+' : ''}${rounded.toFixed(2)}%`,
+    cls: `ticker-val ${rounded > 0 ? 'text-green' : 'text-red'}`,
+  };
+}
 
-  const empty = tradesStream.querySelector('.empty-state');
-  if (empty) empty.remove();
+// Updates stats, trade history and candles for ANY symbol; DOM only for the active one.
+function recordTrade(symbol, trade) {
+  const stats = state.statsBySymbol[symbol];
+  if (!stats) return;
+  const price = trade.price / 100;
 
-  tradesStream.insertBefore(row, tradesStream.firstChild);
-
-  if (tradesStream.children.length > 50) {
-    tradesStream.removeChild(tradesStream.lastChild);
-  }
-
-  // Update Tickers
-  lastTradedPrice.textContent = `$${price}`;
-  tickerLastPrice.textContent = `$${price}`;
-
-  const stats = state.statsBySymbol[state.activeSymbol];
-  const numPrice = parseFloat(price);
-  stats.lastPrice = numPrice;
-  if (numPrice > stats.high) stats.high = numPrice;
-  if (numPrice < stats.low) stats.low = numPrice;
+  if (stats.openPrice === null) stats.openPrice = price;
+  stats.lastPrice = price;
+  stats.high = stats.high === null ? price : Math.max(stats.high, price);
+  stats.low = stats.low === null ? price : Math.min(stats.low, price);
   stats.volume += trade.amount;
   stats.tradesCount++;
 
-  const pctChange = (((numPrice - stats.openPrice) / stats.openPrice) * 100).toFixed(2);
-  tickerChange.textContent = `${pctChange >= 0 ? '+' : ''}${pctChange}%`;
-  tickerChange.className = `ticker-val ${pctChange >= 0 ? 'text-green' : 'text-red'}`;
+  const list = state.recentTrades[symbol];
+  list.unshift(trade);
+  if (list.length > 50) list.pop();
 
-  tickerHigh.textContent = `$${stats.high.toFixed(2)}`;
-  tickerLow.textContent = `$${stats.low.toFixed(2)}`;
-  tickerVolume.textContent = stats.volume.toLocaleString();
-  tickerTradesCount.textContent = stats.tradesCount.toLocaleString();
+  updateCandleOnTrade(symbol, price, trade.amount, trade.timestamp / 1e6);
 
-  const activeTabPrice = document.getElementById(`tabPrice-${state.activeSymbol}`);
-  if (activeTabPrice) activeTabPrice.textContent = `$${price}`;
+  const tabPrice = document.getElementById(`tabPrice-${symbol}`);
+  if (tabPrice) tabPrice.textContent = formatUSD(price);
+}
+
+function renderTradesStream() {
+  const list = state.recentTrades[state.activeSymbol] || [];
+  if (list.length === 0) {
+    tradesStream.innerHTML = '<div class="empty-state">Waiting for executions...</div>';
+    return;
+  }
+  tradesStream.innerHTML = list.map(t => {
+    const sideClass = t.side === 0 ? 'buy' : 'sell';
+    const time = new Date(t.timestamp / 1e6).toLocaleTimeString();
+    return `
+      <div class="trade-row">
+        <span class="trade-price ${sideClass}">$${(t.price / 100).toFixed(2)}</span>
+        <span>${t.amount}</span>
+        <span>${time}</span>
+      </div>`;
+  }).join('');
 }
 
 function renderTickerForActiveSymbol() {
-  const stats = state.statsBySymbol[state.activeSymbol];
-  tickerLastPrice.textContent = `$${stats.lastPrice.toFixed(2)}`;
-  lastTradedPrice.textContent = `$${stats.lastPrice.toFixed(2)}`;
+  const s = state.statsBySymbol[state.activeSymbol];
+  const fmt = v => (v === null ? '—' : formatUSD(v));
 
-  tickerHigh.textContent = `$${stats.high.toFixed(2)}`;
-  tickerLow.textContent = `$${stats.low.toFixed(2)}`;
-  tickerVolume.textContent = stats.volume.toLocaleString();
-  tickerTradesCount.textContent = stats.tradesCount.toLocaleString();
+  tickerLastPrice.textContent = fmt(s.lastPrice);
+  lastTradedPrice.textContent = fmt(s.lastPrice);
+  tickerHigh.textContent = fmt(s.high);
+  tickerLow.textContent = fmt(s.low);
+  tickerVolume.textContent = s.volume.toLocaleString();
+  tickerTradesCount.textContent = s.tradesCount.toLocaleString();
 
-  const pctChange = (((stats.lastPrice - stats.openPrice) / stats.openPrice) * 100).toFixed(2);
-  tickerChange.textContent = `${pctChange >= 0 ? '+' : ''}${pctChange}%`;
-  tickerChange.className = `ticker-val ${pctChange >= 0 ? 'text-green' : 'text-red'}`;
+  const pct = s.openPrice === null || s.lastPrice === null
+    ? null
+    : ((s.lastPrice - s.openPrice) / s.openPrice) * 100;
+  const { text, cls } = formatPct(pct);
+  tickerChange.textContent = text;
+  tickerChange.className = cls;
 }
 
 // --------------------------------------------------------------------------
@@ -944,12 +869,16 @@ async function submitOrder() {
 
     const data = await res.json();
 
-    if (state.type === 0 && data.order && data.order.amount > 0) {
-      state.myOrders.push(data.order);
-      renderOpenOrders();
+    if (data.status === 'RESTING' || data.status === 'PARTIALLY_FILLED_RESTING') {
+      // Subtract maker fills that arrived over WS before this response did.
+      const remaining = data.remaining_amount - takeEarlyFills(data.order.id);
+      if (remaining > 0) {
+        state.myOrders.push({ ...data.order, amount: remaining });
+        renderOpenOrders();
+      }
     }
 
-    fetchOrderBook();
+    scheduleBookRefresh();
   } catch (err) {
     console.error('Submit order error:', err);
   }
@@ -980,22 +909,23 @@ function renderOpenOrders() {
         <td>$${priceFormatted}</td>
         <td>${o.amount}</td>
         <td>
-          <button class="btn-cancel" onclick="cancelOrder(${o.id})">CANCEL</button>
+          <button class="btn-cancel" onclick="cancelOrder(${o.id}, '${o.symbol}')">CANCEL</button>
         </td>
       </tr>
     `;
   }).join('');
 }
 
-window.cancelOrder = async function(id) {
+window.cancelOrder = async function(id, symbol) {
   try {
-    const res = await fetch(`/order?symbol=${state.activeSymbol}&id=${id}`, {
-      method: 'DELETE',
-    });
-    if (res.ok) {
+    const res = await fetch(`/order?symbol=${encodeURIComponent(symbol)}&id=${id}`, { method: 'DELETE' });
+    if (res.ok || res.status === 404) {
+      // 404 means it was already filled or cancelled; either way it is no longer resting.
       state.myOrders = state.myOrders.filter(o => o.id !== id);
       renderOpenOrders();
-      fetchOrderBook();
+      scheduleBookRefresh();
+    } else {
+      alert('Cancel failed: ' + (await res.text()));
     }
   } catch (err) {
     console.error('Cancel order error:', err);
@@ -1004,14 +934,32 @@ window.cancelOrder = async function(id) {
 
 function updateOpenOrdersAfterMatch(trades) {
   trades.forEach(t => {
-    state.myOrders = state.myOrders.map(o => {
-      if (o.id === t.maker_order_id) {
-        return { ...o, amount: o.amount - t.amount };
-      }
-      return o;
-    }).filter(o => o.amount > 0);
+    const idx = state.myOrders.findIndex(o => o.id === t.maker_order_id);
+    if (idx === -1) {
+      // Could be our own order whose POST response hasn't arrived yet.
+      state.earlyMakerFills.set(t.maker_order_id, (state.earlyMakerFills.get(t.maker_order_id) || 0) + t.amount);
+      return;
+    }
+    const o = state.myOrders[idx];
+    const remaining = o.amount - t.amount;
+    if (remaining > 0) {
+      state.myOrders[idx] = { ...o, amount: remaining };
+    } else {
+      state.myOrders.splice(idx, 1);
+    }
   });
+
+  // Bound memory: keep only the most recent 1000 entries (Map preserves insertion order).
+  while (state.earlyMakerFills.size > 1000) {
+    state.earlyMakerFills.delete(state.earlyMakerFills.keys().next().value);
+  }
   renderOpenOrders();
+}
+
+function takeEarlyFills(id) {
+  const filled = state.earlyMakerFills.get(id) || 0;
+  state.earlyMakerFills.delete(id);
+  return filled;
 }
 
 // --------------------------------------------------------------------------
@@ -1089,6 +1037,7 @@ symbolTabs.addEventListener('click', (e) => {
     inputPrice.value = '64000.00';
   }
   renderTickerForActiveSymbol();
+  renderTradesStream();
 
   updateTotal();
   updateOHLCHeader();
@@ -1099,18 +1048,31 @@ symbolTabs.addEventListener('click', (e) => {
   renderOpenOrders();
 });
 
+function renderBotButton() {
+  btnToggleBot.classList.toggle('active', state.botRunning);
+  botLabel.textContent = state.botRunning ? 'BOT: ACTIVE' : 'BOT: PAUSED';
+}
+
+async function syncBotStatus() {
+  try {
+    const res = await fetch('/simulator/status');
+    if (!res.ok) return;
+    state.botRunning = (await res.json()).running;
+    renderBotButton();
+  } catch (err) {
+    console.error('Bot status error:', err);
+  }
+}
+
 btnToggleBot.addEventListener('click', async () => {
   try {
     const res = await fetch('/simulator/toggle', { method: 'POST' });
-    const data = await res.json();
-    state.botRunning = data.running;
-    if (state.botRunning) {
-      btnToggleBot.classList.add('active');
-      botLabel.textContent = 'BOT: ACTIVE';
-    } else {
-      btnToggleBot.classList.remove('active');
-      botLabel.textContent = 'BOT: PAUSED';
+    if (!res.ok) {
+      alert('Toggle failed: ' + (await res.text()));
+      return;
     }
+    state.botRunning = (await res.json()).running;
+    renderBotButton();
   } catch (err) {
     console.error('Toggle bot error:', err);
   }
@@ -1127,7 +1089,9 @@ btnSubmitOrder.addEventListener('click', submitOrder);
 // 13. Initialization
 // --------------------------------------------------------------------------
 connectWebSocket();
+syncBotStatus();
 updateTotal();
 updateOHLCHeader();
 renderTickerForActiveSymbol();
+renderTradesStream();
 renderPriceChart();

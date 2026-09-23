@@ -1,84 +1,155 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
+	"mime"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/divya-3005/OME/server/engine"
 )
 
+var supportedSymbols = []string{"AAPL", "TSLA", "BTC-USD"}
+
 func main() {
-	// Initialize the engine and websocket hub
 	eng := engine.NewEngine()
 	eng.SetMinOrderID(uint64(time.Now().UnixMilli()))
 
 	hub := NewHub()
 	go hub.Run()
 
-	// Pre-register supported symbols
-	eng.RegisterSymbol("AAPL")
-	eng.RegisterSymbol("TSLA")
-	eng.RegisterSymbol("BTC-USD")
+	for _, sym := range supportedSymbols {
+		eng.RegisterSymbol(sym)
+	}
 
-	// Initialize Write-Ahead Log (WAL) and recover past state
 	wal, err := engine.OpenWAL("wal.log")
 	if err != nil {
 		log.Fatalf("failed to open WAL: %v", err)
 	}
-	defer wal.Close()
-
-	if maxID, err := wal.Recover(eng); err != nil {
-		log.Printf("WAL recovery warning: %v", err)
-	} else {
-		log.Printf("WAL recovery complete: restored state (highest order ID: %d)", maxID)
+	maxID, err := wal.Recover(eng)
+	if err != nil {
+		wal.Close()
+		log.Fatalf("WAL recovery failed, refusing to start: %v", err)
 	}
+	log.Printf("WAL recovery complete: restored state (highest order ID: %d)", maxID)
 
-	// Initialize Market Simulator & Seeder
 	sim := NewMarketSimulator(eng, hub, wal)
-
-	// Seed each symbol individually if its order book is empty
-	symbols := []string{"AAPL", "TSLA", "BTC-USD"}
-	for _, sym := range symbols {
-		if ob, exists := eng.GetOrderBook(sym); exists {
-			bids, _ := ob.GetSnapshot()
-			if len(bids) == 0 {
-				log.Printf("Seeding market with initial liquidity for %s...", sym)
-				sim.SeedSymbol(sym)
-			}
-		}
+	for _, sym := range supportedSymbols {
+		sim.EnsureLiquidity(sym)
 	}
-
-	// Start live background bot simulation
 	sim.Start()
 	log.Println("Market Simulator active: simulating live institutional order flow")
 
-	// REST & WebSocket endpoints
-	http.HandleFunc("POST /order", handlePlaceOrder(eng, hub, wal))
-	http.HandleFunc("DELETE /order", handleCancelOrder(eng, hub, wal))
-	http.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
-	http.HandleFunc("/ws", handleWebSocket(hub))
-
-	// Simulator control endpoints
-	http.HandleFunc("POST /simulator/toggle", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /order", requireAllowedOrigin(handlePlaceOrder(eng, hub, wal)))
+	mux.HandleFunc("DELETE /order", requireAllowedOrigin(handleCancelOrder(eng, hub, wal)))
+	mux.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
+	mux.HandleFunc("/ws", handleWebSocket(hub))
+	mux.HandleFunc("POST /simulator/toggle", requireAllowedOrigin(func(w http.ResponseWriter, r *http.Request) {
 		running := sim.Toggle()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"running": running})
-	})
-	http.HandleFunc("GET /simulator/status", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.HandleFunc("GET /simulator/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]bool{"running": sim.IsRunning()})
 	})
+	mux.Handle("/", http.FileServer(http.Dir("./public")))
 
-	// Serve static frontend UI
-	http.Handle("/", http.FileServer(http.Dir("./public")))
+	srv := &http.Server{Addr: ":8080", Handler: mux}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- srv.ListenAndServe() }()
 	log.Println("Order Matching Engine running on http://localhost:8080")
 	log.Println("WebSocket stream available at ws://localhost:8080/ws")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	exitCode := 0
+	select {
+	case <-ctx.Done():
+		log.Println("shutdown signal received")
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("HTTP server error: %v", err)
+			exitCode = 1
+		}
+	}
+
+	// Order matters: stop accepting requests, stop the bot, then close the WAL.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown: %v", err)
+	}
+	sim.Stop()
+	if err := wal.Close(); err != nil {
+		log.Printf("WAL close: %v", err)
+		exitCode = 1
+	}
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+// requireAllowedOrigin rejects state-changing requests coming from untrusted browser origins.
+func requireAllowedOrigin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isAllowedOrigin(r) {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func isJSONRequest(r *http.Request) bool {
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mt == "application/json"
+}
+
+// writeEngineError maps engine errors to HTTP status codes.
+func writeEngineError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, engine.ErrInvalidOrder), errors.Is(err, engine.ErrUnknownSymbol):
+		status = http.StatusBadRequest
+	case errors.Is(err, engine.ErrDuplicateOrderID):
+		status = http.StatusConflict
+	case errors.Is(err, engine.ErrOrderNotFound):
+		status = http.StatusNotFound
+	case errors.Is(err, engine.ErrWAL):
+		status = http.StatusServiceUnavailable
+	}
+	http.Error(w, err.Error(), status)
+}
+
+// publishOrderEvents returns a notify callback that broadcasts trades and book updates.
+// It runs under the order book lock, so events are published in execution order.
+func publishOrderEvents(hub *Hub, symbol string) func([]*engine.Trade, bool) {
+	return func(trades []*engine.Trade, rested bool) {
+		if len(trades) > 0 {
+			hub.BroadcastJSON(map[string]interface{}{
+				"type":   "trades",
+				"symbol": symbol,
+				"data":   trades,
+			})
+		}
+		if rested {
+			hub.BroadcastJSON(map[string]interface{}{
+				"type":   "book_update",
+				"symbol": symbol,
+			})
+		}
+	}
 }
 
 // handleWebSocket upgrades incoming HTTP connections to WebSocket and registers a non-blocking Client
@@ -89,59 +160,51 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 			log.Printf("failed to upgrade websocket: %v", err)
 			return
 		}
-
 		client := &Client{
 			hub:  hub,
 			conn: conn,
 			send: make(chan []byte, sendBufferSize),
 		}
 		hub.register <- client
-
 		go client.writePump()
 		go client.readPump()
 	}
 }
 
-// handlePlaceOrder processes incoming POST /order requests with atomic WAL logging & fsync (eliminates TOCTOU)
+// handlePlaceOrder processes POST /order.
 func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !isJSONRequest(r) {
+			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+			return
+		}
+
 		var order engine.Order
 		if err := json.NewDecoder(r.Body).Decode(&order); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		// Auto-generate unique order ID if omitted or 0
-		if order.ID == 0 {
-			order.ID = eng.NextOrderID()
-		}
-
-		if order.Timestamp == 0 {
-			order.Timestamp = time.Now().UnixNano()
-		}
-
-		// Validate Side and Type enum integrity
-		if order.Side != engine.Buy && order.Side != engine.Sell {
-			http.Error(w, fmt.Sprintf("invalid order side: %d (must be 0 for Buy or 1 for Sell)", order.Side), http.StatusBadRequest)
+		// Order IDs and timestamps are always server-assigned so they can never collide.
+		if order.ID != 0 {
+			http.Error(w, "id must not be supplied; the server assigns order IDs", http.StatusBadRequest)
 			return
 		}
-		if order.Type != engine.Limit && order.Type != engine.Market {
-			http.Error(w, fmt.Sprintf("invalid order type: %d (must be 0 for Limit or 1 for Market)", order.Type), http.StatusBadRequest)
-			return
-		}
+		order.ID = eng.NextOrderID()
+		order.Timestamp = time.Now().UnixNano()
 
-		requestedAmount := order.Amount
-		trades, err := eng.ProcessOrderWithWAL(&order, wal)
+		submitted := order // snapshot before matching mutates Amount
+		trades, err := eng.ProcessOrderWithWALNotify(&order, wal, publishOrderEvents(hub, order.Symbol))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeEngineError(w, err)
 			return
 		}
 
-		var filledAmount uint64 = 0
+		var filledAmount uint64
 		for _, t := range trades {
 			filledAmount += t.Amount
 		}
-		remainingAmount := requestedAmount - filledAmount
+		remainingAmount := submitted.Amount - filledAmount
 
 		status := "FILLED"
 		if remainingAmount > 0 {
@@ -160,19 +223,11 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			}
 		}
 
-		if len(trades) > 0 {
-			hub.BroadcastJSON(map[string]interface{}{
-				"type":   "trades",
-				"symbol": order.Symbol,
-				"data":   trades,
-			})
-		}
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"order":            order,
+			"order":            submitted,
 			"trades":           trades,
-			"requested_amount": requestedAmount,
+			"requested_amount": submitted.Amount,
 			"filled_amount":    filledAmount,
 			"remaining_amount": remainingAmount,
 			"status":           status,
@@ -180,7 +235,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 	}
 }
 
-// handleCancelOrder processes DELETE /order?symbol=AAPL&id=1 with atomic WAL logging & fsync
+// handleCancelOrder processes DELETE /order?symbol=AAPL&id=1.
 func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
@@ -192,19 +247,16 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 			return
 		}
 
-		// CancelOrderWithWAL atomically checks order existence, writes to WAL, calls wal.Sync(), and removes within book lock
-		success, err := eng.CancelOrderWithWAL(symbol, orderID, wal)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-
-		if success {
+		success, err := eng.CancelOrderWithWALNotify(symbol, orderID, wal, func() {
 			hub.BroadcastJSON(map[string]interface{}{
 				"type":     "order_cancelled",
 				"symbol":   symbol,
 				"order_id": orderID,
 			})
+		})
+		if err != nil {
+			writeEngineError(w, err)
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -224,9 +276,7 @@ func handleGetOrderBook(eng *engine.Engine) http.HandlerFunc {
 			http.Error(w, "symbol not found", http.StatusNotFound)
 			return
 		}
-
 		bids, asks := ob.GetSnapshot()
-
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"symbol": symbol,

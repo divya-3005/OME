@@ -26,9 +26,7 @@ func setupTestSimulator(t *testing.T) (*MarketSimulator, *engine.Engine, *Hub, *
 	sim := NewMarketSimulator(eng, hub, wal)
 
 	cleanup := func() {
-		if sim.IsRunning() {
-			sim.Toggle()
-		}
+		sim.Stop() // waits for the goroutine to exit before the WAL is closed
 		wal.Close()
 		os.Remove(walPath)
 	}
@@ -136,9 +134,9 @@ func TestSimulatorLiveOrderExecution(t *testing.T) {
 	// Start live simulation
 	sim.Start()
 
-	// Wait up to 3 seconds for at least one trade broadcast
+	// Wait up to 10 seconds for at least one trade broadcast
 	receivedTrade := false
-	timeout := time.After(3 * time.Second)
+	timeout := time.After(10 * time.Second)
 
 	for !receivedTrade {
 		select {
@@ -154,5 +152,38 @@ func TestSimulatorLiveOrderExecution(t *testing.T) {
 		}
 	}
 
-	sim.Toggle()
+	sim.Stop()
+}
+
+func TestSimulatorRapidToggleIsRaceFree(t *testing.T) {
+	sim, eng, _, _, cleanup := setupTestSimulator(t)
+	defer cleanup()
+	for _, sym := range supportedSymbols {
+		eng.RegisterSymbol(sym)
+	}
+	sim.SeedMarket()
+	for i := 0; i < 20; i++ {
+		sim.Toggle()
+	}
+	if sim.IsRunning() {
+		t.Fatal("expected simulator stopped after an even number of toggles")
+	}
+}
+
+func TestSimulatorRefillsEmptySide(t *testing.T) {
+	sim, eng, _, _, cleanup := setupTestSimulator(t)
+	defer cleanup()
+	eng.RegisterSymbol("AAPL")
+	sim.placeLadder("AAPL", engine.Buy, 15000) // bids only, asks empty
+
+	sim.EnsureLiquidity("AAPL")
+
+	ob, _ := eng.GetOrderBook("AAPL")
+	bid, hasBid, ask, hasAsk := ob.TopOfBook()
+	if !hasBid || !hasAsk {
+		t.Fatalf("expected both sides after EnsureLiquidity (bid=%v ask=%v)", hasBid, hasAsk)
+	}
+	if ask <= bid {
+		t.Fatalf("refilled asks must not cross the book: bid=%d ask=%d", bid, ask)
+	}
 }

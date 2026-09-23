@@ -233,3 +233,35 @@ func TestWebSocketIntegration(t *testing.T) {
 		t.Errorf("expected symbol TSLA, got %v", data["symbol"])
 	}
 }
+
+func TestWebSocketOneEventPerFrame(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	server := httptest.NewServer(handleWebSocket(hub))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	for i := 0; i < 20; i++ {
+		hub.BroadcastJSON(map[string]int{"seq": i})
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for i := 0; i < 20; i++ {
+		_, p, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		var m map[string]int
+		if err := json.Unmarshal(p, &m); err != nil {
+			t.Fatalf("frame %d is not a single JSON object: %q", i, p)
+		}
+		if m["seq"] != i {
+			t.Fatalf("out of order: got %d want %d", m["seq"], i)
+		}
+	}
+}

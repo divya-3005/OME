@@ -207,47 +207,69 @@ func (ob *OrderBook) HasOrder(orderID uint64) bool {
 	return exists
 }
 
-// ProcessOrderWithWAL atomically validates, persists to WAL with fsync, and processes an order within the book lock
+// validate checks admission rules. Caller must hold ob.mu.
+func (ob *OrderBook) validate(order *Order) error {
+	if order == nil {
+		return fmt.Errorf("%w: order cannot be nil", ErrInvalidOrder)
+	}
+	if order.ID == 0 {
+		return fmt.Errorf("%w: order ID must be positive", ErrInvalidOrder)
+	}
+	if _, exists := ob.Orders[order.ID]; exists {
+		return fmt.Errorf("%w: %d", ErrDuplicateOrderID, order.ID)
+	}
+	if order.Side != Buy && order.Side != Sell {
+		return fmt.Errorf("%w: invalid side %d (must be 0 for Buy or 1 for Sell)", ErrInvalidOrder, order.Side)
+	}
+	if order.Type != Limit && order.Type != Market {
+		return fmt.Errorf("%w: invalid type %d (must be 0 for Limit or 1 for Market)", ErrInvalidOrder, order.Type)
+	}
+	if order.Amount == 0 || order.Amount > MaxOrderAmount {
+		return fmt.Errorf("%w: amount must be between 1 and %d", ErrInvalidOrder, MaxOrderAmount)
+	}
+	if order.Type == Limit && (order.Price == 0 || order.Price > MaxOrderPrice) {
+		return fmt.Errorf("%w: limit price must be between 1 and %d", ErrInvalidOrder, MaxOrderPrice)
+	}
+	return nil
+}
+
+// ProcessOrderWithWAL validates, persists (write + fsync) and matches an order under the book lock.
 func (ob *OrderBook) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
+	return ob.ProcessOrderWithWALNotify(order, wal, nil)
+}
+
+// ProcessOrderWithWALNotify is ProcessOrderWithWAL plus an optional notify callback.
+// notify runs while the book lock is still held, so events for one symbol are published
+// in exactly the order they executed. It is called only if the order produced trades or
+// left a resting remainder. notify must not call back into this OrderBook.
+func (ob *OrderBook) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify func(trades []*Trade, rested bool)) ([]*Trade, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
-	if order == nil {
-		return nil, fmt.Errorf("order cannot be nil")
-	}
-	if order.ID == 0 {
-		return nil, fmt.Errorf("order ID must be positive")
-	}
-	if _, exists := ob.Orders[order.ID]; exists {
-		return nil, fmt.Errorf("duplicate order ID: %d", order.ID)
-	}
-	if order.Side != Buy && order.Side != Sell {
-		return nil, fmt.Errorf("invalid order side: %d (must be 0 for Buy or 1 for Sell)", order.Side)
-	}
-	if order.Type != Limit && order.Type != Market {
-		return nil, fmt.Errorf("invalid order type: %d (must be 0 for Limit or 1 for Market)", order.Type)
-	}
-	if order.Amount == 0 {
-		return nil, fmt.Errorf("order amount must be greater than 0")
-	}
-	if order.Type == Limit && order.Price == 0 {
-		return nil, fmt.Errorf("limit order price must be greater than 0")
+	if err := ob.validate(order); err != nil {
+		return nil, err
 	}
 
-	// Persist to WAL and sync atomically inside lock to avoid TOCTOU races
+	// LogPlace writes AND fsyncs; it returns an error wrapping ErrWAL on any failure,
+	// in which case nothing is applied to the book.
 	if wal != nil {
 		if err := wal.LogPlace(order); err != nil {
-			return nil, fmt.Errorf("WAL log error: %w", err)
-		}
-		if err := wal.Sync(); err != nil {
-			return nil, fmt.Errorf("WAL sync error: %w", err)
+			return nil, err
 		}
 	}
 
+	var trades []*Trade
 	if order.Side == Buy {
-		return ob.matchBuyOrder(order), nil
+		trades = ob.matchBuyOrder(order)
+	} else {
+		trades = ob.matchSellOrder(order)
 	}
-	return ob.matchSellOrder(order), nil
+
+	rested := order.Type == Limit && order.Amount > 0
+	if notify != nil && (len(trades) > 0 || rested) {
+		notify(trades, rested)
+	}
+	return trades, nil
 }
 
 // ProcessOrder is the thread-safe entry point to submit an order without WAL
@@ -255,22 +277,25 @@ func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
 	return ob.ProcessOrderWithWAL(order, nil)
 }
 
-// CancelOrderWithWAL atomically validates, persists to WAL with fsync, and cancels an order within the book lock
+// CancelOrderWithWAL cancels a resting order with WAL persistence under the book lock.
 func (ob *OrderBook) CancelOrderWithWAL(orderID uint64, wal *WAL) (bool, error) {
+	return ob.CancelOrderWithWALNotify(orderID, wal, nil)
+}
+
+// CancelOrderWithWALNotify is CancelOrderWithWAL plus a notify callback run under the book lock
+// after a successful cancel.
+func (ob *OrderBook) CancelOrderWithWALNotify(orderID uint64, wal *WAL, notify func()) (bool, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
 	order, exists := ob.Orders[orderID]
 	if !exists {
-		return false, fmt.Errorf("order ID %d not found", orderID)
+		return false, fmt.Errorf("%w: %d", ErrOrderNotFound, orderID)
 	}
 
 	if wal != nil {
 		if err := wal.LogCancel(ob.Symbol, orderID); err != nil {
-			return false, fmt.Errorf("WAL cancel error: %w", err)
-		}
-		if err := wal.Sync(); err != nil {
-			return false, fmt.Errorf("WAL sync error: %w", err)
+			return false, err
 		}
 	}
 
@@ -303,6 +328,9 @@ func (ob *OrderBook) CancelOrderWithWAL(orderID uint64, wal *WAL) (bool, error) 
 	}
 
 	delete(ob.Orders, orderID)
+	if notify != nil {
+		notify()
+	}
 	return true, nil
 }
 
@@ -310,6 +338,19 @@ func (ob *OrderBook) CancelOrderWithWAL(orderID uint64, wal *WAL) (bool, error) 
 func (ob *OrderBook) CancelOrder(orderID uint64) bool {
 	ok, _ := ob.CancelOrderWithWAL(orderID, nil)
 	return ok
+}
+
+// TopOfBook returns the best bid and best ask independently.
+func (ob *OrderBook) TopOfBook() (bid uint64, hasBid bool, ask uint64, hasAsk bool) {
+	ob.mu.RLock()
+	defer ob.mu.RUnlock()
+	if len(ob.Bids) > 0 {
+		bid, hasBid = ob.Bids[0].Price, true
+	}
+	if len(ob.Asks) > 0 {
+		ask, hasAsk = ob.Asks[0].Price, true
+	}
+	return
 }
 
 // GetSnapshot returns a thread-safe copy of bids and asks for L2 market data

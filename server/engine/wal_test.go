@@ -1,7 +1,10 @@
 package engine
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -179,3 +182,99 @@ func TestWALNilOrderRecovery(t *testing.T) {
 	}
 }
 
+func TestWALDropsTornFinalRecordAndStaysAppendable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "torn.log")
+
+	wal, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.LogPlace(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10}); err != nil {
+		t.Fatal(err)
+	}
+	wal.Close()
+
+	// A complete JSON object whose trailing newline never reached disk.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.WriteString(`{"action":"PLACE","order":{"id":2,"symbol":"AAPL","side":0,"type":0,"price":101,"amount":5}}`)
+	f.Close()
+
+	eng := NewEngine()
+	w2, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.Recover(eng); err != nil {
+		t.Fatal(err)
+	}
+	ob, _ := eng.GetOrderBook("AAPL")
+	if _, ok := ob.Orders[2]; ok {
+		t.Fatal("torn record must not be replayed")
+	}
+	if err := w2.LogPlace(&Order{ID: 3, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 102, Amount: 5}); err != nil {
+		t.Fatal(err)
+	}
+	w2.Close()
+
+	eng3 := NewEngine()
+	w3, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w3.Close()
+	if _, err := w3.Recover(eng3); err != nil {
+		t.Fatal(err)
+	}
+	ob3, _ := eng3.GetOrderBook("AAPL")
+	if len(ob3.Orders) != 2 {
+		t.Fatalf("expected orders 1 and 3 after second recovery, got %d orders", len(ob3.Orders))
+	}
+}
+
+func TestWALRefusesToTruncateMidFileCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mid.log")
+
+	w, _ := OpenWAL(path)
+	w.LogPlace(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10})
+	w.Close()
+
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	f.WriteString("garbage-line\n")
+	f.Close()
+
+	w2, _ := OpenWAL(path)
+	w2.LogPlace(&Order{ID: 2, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 101, Amount: 10})
+	w2.Close()
+
+	before, _ := os.Stat(path)
+
+	w3, _ := OpenWAL(path)
+	defer w3.Close()
+	if _, err := w3.Recover(NewEngine()); err == nil {
+		t.Fatal("expected Recover to fail on mid-file corruption")
+	}
+	after, _ := os.Stat(path)
+	if after.Size() != before.Size() {
+		t.Fatalf("WAL must not be truncated on mid-file corruption: %d -> %d bytes", before.Size(), after.Size())
+	}
+}
+
+func TestWALFailsClosedAfterWriteError(t *testing.T) {
+	w, err := OpenWAL(filepath.Join(t.TempDir(), "broken.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.file.Close() // force every write (and the rollback) to fail
+
+	err = w.LogPlace(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 1})
+	if !errors.Is(err, ErrWAL) {
+		t.Fatalf("expected ErrWAL, got %v", err)
+	}
+	err = w.LogPlace(&Order{ID: 2, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 1})
+	if err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("expected WAL to stay disabled after an unrecoverable failure, got %v", err)
+	}
+}

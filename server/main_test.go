@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/divya-3005/OME/server/engine"
@@ -51,6 +52,7 @@ func TestHandlePlaceOrder(t *testing.T) {
 	}
 	body, _ := json.Marshal(orderPayload)
 	req := httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
 	handler(rec, req)
@@ -83,6 +85,7 @@ func TestHandlePlaceOrder(t *testing.T) {
 	}
 	body, _ = json.Marshal(sellPayload)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 
 	handler(rec, req)
@@ -106,6 +109,7 @@ func TestHandlePlaceOrder(t *testing.T) {
 
 	// 3. Invalid JSON payload
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader([]byte("{invalid-json")))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -122,6 +126,7 @@ func TestHandlePlaceOrder(t *testing.T) {
 	}
 	body, _ = json.Marshal(badSidePayload)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -138,6 +143,7 @@ func TestHandlePlaceOrder(t *testing.T) {
 	}
 	body, _ = json.Marshal(badTypePayload)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -154,6 +160,7 @@ func TestHandlePlaceOrder(t *testing.T) {
 	}
 	body, _ = json.Marshal(badSymPayload)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
 	if rec.Code != http.StatusBadRequest {
@@ -176,6 +183,7 @@ func TestHandleMarketOrderVariations(t *testing.T) {
 	}
 	body, _ := json.Marshal(mktPayload)
 	req := httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler(rec, req)
 
@@ -198,6 +206,7 @@ func TestHandleMarketOrderVariations(t *testing.T) {
 	}
 	body, _ = json.Marshal(limitAsk)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
 
@@ -210,6 +219,7 @@ func TestHandleMarketOrderVariations(t *testing.T) {
 	}
 	body, _ = json.Marshal(mktBuyLarge)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	handler(rec, req)
 
@@ -240,6 +250,7 @@ func TestHandleCancelOrder(t *testing.T) {
 	}
 	body, _ := json.Marshal(orderPayload)
 	req := httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	placeHandler(rec, req)
 
@@ -304,6 +315,7 @@ func TestHandleGetOrderBook(t *testing.T) {
 	}
 	body, _ := json.Marshal(orderPayload)
 	req = httptest.NewRequest("POST", "/order", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
 	placeHandler(rec, req)
 
@@ -369,5 +381,81 @@ func TestSimulatorEndpoints(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &toggleResp)
 	if toggleResp["running"] != false {
 		t.Errorf("expected simulator running: false after second toggle, got %v", toggleResp["running"])
+	}
+}
+
+func TestPlaceOrderRejectsClientSuppliedID(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	body := `{"id":101,"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":1}`
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handlePlaceOrder(eng, hub, wal)(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for client-supplied id, got %d", rec.Code)
+	}
+}
+
+func TestPlaceOrderResponseReportsSubmittedAmount(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	h := handlePlaceOrder(eng, hub, wal)
+	post := func(body string) map[string]interface{} {
+		req := httptest.NewRequest("POST", "/order", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		var resp map[string]interface{}
+		json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp
+	}
+	post(`{"symbol":"AAPL","side":1,"type":0,"price":15000,"amount":4}`)
+	resp := post(`{"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":10}`)
+	if got := resp["order"].(map[string]interface{})["amount"].(float64); got != 10 {
+		t.Errorf("order.amount must be the submitted amount 10, got %v", got)
+	}
+	if resp["remaining_amount"].(float64) != 6 || resp["status"] != "PARTIALLY_FILLED_RESTING" {
+		t.Errorf("unexpected remaining/status: %v / %v", resp["remaining_amount"], resp["status"])
+	}
+}
+
+func TestPlaceOrderRequiresJSONContentType(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":1,"amount":1}`))
+	req.Header.Set("Content-Type", "text/plain")
+	rec := httptest.NewRecorder()
+	handlePlaceOrder(eng, hub, wal)(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415, got %d", rec.Code)
+	}
+}
+
+func TestStateChangingRoutesRejectForeignOrigin(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	h := requireAllowedOrigin(handlePlaceOrder(eng, hub, wal))
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":1,"amount":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://evil.example")
+	req.Host = "localhost:8080"
+	rec := httptest.NewRecorder()
+	h(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+}
+
+func TestPlaceOrderWALFailureReturns503(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+	wal.Close() // every subsequent WAL write fails
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handlePlaceOrder(eng, hub, wal)(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on WAL failure, got %d", rec.Code)
 	}
 }

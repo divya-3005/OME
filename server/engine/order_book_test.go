@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -185,29 +186,23 @@ func BenchmarkProcessOrder(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_, _ = ob.ProcessOrder(&Order{
-			ID:        nextID,
-			Symbol:    "AAPL",
-			Side:      Buy,
-			Type:      Limit,
-			Price:     105,
-			Amount:    1,
-			Timestamp: int64(i),
+		trades, err := ob.ProcessOrder(&Order{
+			ID: nextID, Symbol: "AAPL", Side: Buy, Type: Limit,
+			Price: 105, Amount: 1, Timestamp: int64(i),
 		})
 		nextID++
+		if err != nil || len(trades) != 1 {
+			b.Fatalf("iteration %d: buy must match exactly one resting ask (err=%v, trades=%d)", i, err, len(trades))
+		}
 
-		// Replenish the unit of ask liquidity just consumed so the book
-		// never runs dry and the matching path is exercised for the
-		// entire benchmark, not just the first ~10,000 iterations.
-		_, _ = ob.ProcessOrder(&Order{
-			ID:        nextID,
-			Symbol:    "AAPL",
-			Side:      Sell,
-			Type:      Limit,
-			Price:     uint64(100 + (i % 10)),
-			Amount:    1,
-			Timestamp: int64(i),
-		})
+		// Put the consumed unit back at the exact price it traded, so the book shape never
+		// changes and every iteration exercises the matching path.
+		if _, err := ob.ProcessOrder(&Order{
+			ID: nextID, Symbol: "AAPL", Side: Sell, Type: Limit,
+			Price: trades[0].Price, Amount: 1, Timestamp: int64(i),
+		}); err != nil {
+			b.Fatal(err)
+		}
 		nextID++
 	}
 }
@@ -232,15 +227,21 @@ func BenchmarkProcessOrderWithWAL(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = ob.ProcessOrderWithWAL(&Order{
+		trades, err := ob.ProcessOrderWithWAL(&Order{
 			ID: nextID, Symbol: "AAPL", Side: Buy, Type: Limit,
 			Price: 105, Amount: 1, Timestamp: int64(i),
 		}, wal)
 		nextID++
-		_, _ = ob.ProcessOrderWithWAL(&Order{
+		if err != nil || len(trades) != 1 {
+			b.Fatalf("iteration %d: buy must match exactly one resting ask (err=%v, trades=%d)", i, err, len(trades))
+		}
+
+		if _, err := ob.ProcessOrderWithWAL(&Order{
 			ID: nextID, Symbol: "AAPL", Side: Sell, Type: Limit,
-			Price: uint64(100 + (i % 10)), Amount: 1, Timestamp: int64(i),
-		}, wal)
+			Price: trades[0].Price, Amount: 1, Timestamp: int64(i),
+		}, wal); err != nil {
+			b.Fatal(err)
+		}
 		nextID++
 	}
 }
@@ -342,4 +343,12 @@ func TestConcurrentOrders(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestRejectsOversizedAmount(t *testing.T) {
+	ob := NewOrderBook("AAPL")
+	_, err := ob.ProcessOrder(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: MaxOrderAmount + 1})
+	if !errors.Is(err, ErrInvalidOrder) {
+		t.Fatalf("expected ErrInvalidOrder, got %v", err)
+	}
 }

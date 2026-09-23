@@ -64,18 +64,21 @@ func (e *Engine) GetOrderBook(symbol string) (*OrderBook, bool) {
 	return ob, exists
 }
 
-// ProcessOrderWithWAL routes an incoming order to its respective OrderBook with atomic WAL logging & fsync
-func (e *Engine) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
+// ProcessOrderWithWALNotify routes an order to its book. See OrderBook.ProcessOrderWithWALNotify.
+func (e *Engine) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify func(trades []*Trade, rested bool)) ([]*Trade, error) {
 	if order == nil {
-		return nil, fmt.Errorf("order cannot be nil")
+		return nil, fmt.Errorf("%w: order cannot be nil", ErrInvalidOrder)
 	}
-
 	ob, exists := e.GetOrderBook(order.Symbol)
 	if !exists {
-		return nil, fmt.Errorf("symbol %s not supported", order.Symbol)
+		return nil, fmt.Errorf("%w: %q", ErrUnknownSymbol, order.Symbol)
 	}
+	return ob.ProcessOrderWithWALNotify(order, wal, notify)
+}
 
-	return ob.ProcessOrderWithWAL(order, wal)
+// ProcessOrderWithWAL routes an order to its book with WAL persistence.
+func (e *Engine) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
+	return e.ProcessOrderWithWALNotify(order, wal, nil)
 }
 
 // ProcessOrder routes an incoming order to its respective OrderBook without WAL
@@ -83,14 +86,18 @@ func (e *Engine) ProcessOrder(order *Order) ([]*Trade, error) {
 	return e.ProcessOrderWithWAL(order, nil)
 }
 
-// CancelOrderWithWAL cancels an order for a given symbol with atomic WAL logging & fsync
-func (e *Engine) CancelOrderWithWAL(symbol string, orderID uint64, wal *WAL) (bool, error) {
+// CancelOrderWithWALNotify cancels an order in the given symbol's book.
+func (e *Engine) CancelOrderWithWALNotify(symbol string, orderID uint64, wal *WAL, notify func()) (bool, error) {
 	ob, exists := e.GetOrderBook(symbol)
 	if !exists {
-		return false, fmt.Errorf("symbol %s not supported", symbol)
+		return false, fmt.Errorf("%w: %q", ErrUnknownSymbol, symbol)
 	}
+	return ob.CancelOrderWithWALNotify(orderID, wal, notify)
+}
 
-	return ob.CancelOrderWithWAL(orderID, wal)
+// CancelOrderWithWAL cancels an order with WAL persistence.
+func (e *Engine) CancelOrderWithWAL(symbol string, orderID uint64, wal *WAL) (bool, error) {
+	return e.CancelOrderWithWALNotify(symbol, orderID, wal, nil)
 }
 
 // CancelOrder cancels an order for a given symbol without WAL

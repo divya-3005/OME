@@ -64,4 +64,3 @@ func (pl *PriceLevel) RemoveOrder(order *Order) {
 func (pl *PriceLevel) IsEmpty() bool {
 	return pl.Head == nil
 }
-

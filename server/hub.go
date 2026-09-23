@@ -20,31 +20,32 @@ const (
 	sendBufferSize = 256
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true // Non-browser clients (e.g. bots, CLI, automated tests)
-		}
-		u, err := url.Parse(origin)
-		if err != nil {
-			return false
-		}
-		// Allow same host or local development loopback
-		if u.Host == r.Host || u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" {
-			return true
-		}
-		// Allow custom origins configured in ALLOWED_ORIGINS env var
-		if allowed := os.Getenv("ALLOWED_ORIGINS"); allowed != "" {
-			for _, a := range strings.Split(allowed, ",") {
-				if strings.TrimSpace(a) == origin {
-					return true
-				}
+// isAllowedOrigin reports whether a request's Origin is trusted. Requests without an
+// Origin header (curl, bots, tests) are allowed; browsers always send Origin on
+// WebSocket upgrades and on non-GET requests.
+func isAllowedOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Host == r.Host || u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" {
+		return true
+	}
+	if allowed := os.Getenv("ALLOWED_ORIGINS"); allowed != "" {
+		for _, a := range strings.Split(allowed, ",") {
+			if strings.TrimSpace(a) == origin {
+				return true
 			}
 		}
-		return false
-	},
+	}
+	return false
 }
+
+var upgrader = websocket.Upgrader{CheckOrigin: isAllowedOrigin}
 
 // Client is a middleman between the websocket connection and the hub
 type Client struct {
@@ -87,21 +88,8 @@ func (c *Client) writePump() {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
-
-			// Add queued messages to the current websocket message
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.send)
-			}
-
-			if err := w.Close(); err != nil {
+			// Exactly one JSON event per WebSocket frame.
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
 				return
 			}
 		case <-ticker.C:
