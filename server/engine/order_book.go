@@ -24,8 +24,9 @@ type OrderBook struct {
 	Asks []*PriceLevel // Sorted ascending: lowest price first
 
 	// Quick lookups
-	Orders     map[uint64]*Order    // OrderID -> *Order for O(1) cancellations
+	Orders     map[uint64]*Order   // OrderID -> *Order for O(1) cancellations
 	seenOrders map[uint64]struct{} // Lifetime order IDs seen by this book
+	wal        *WAL                // Optional Write-Ahead Log for crash resilience
 }
 
 // NewOrderBook initializes an empty OrderBook for a symbol
@@ -37,6 +38,13 @@ func NewOrderBook(symbol string) *OrderBook {
 		Orders:     make(map[uint64]*Order),
 		seenOrders: make(map[uint64]struct{}),
 	}
+}
+
+// SetWAL configures Write-Ahead Logging on this OrderBook.
+func (ob *OrderBook) SetWAL(wal *WAL) {
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
+	ob.wal = wal
 }
 
 // getOrCreateBidLevel finds an existing Bid level or inserts a new one in descending order using binary search lookup (O(log P)) and slice insertion shift (O(P))
@@ -210,15 +218,6 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 	return trades
 }
 
-// HasOrder checks if an order with the given ID is currently resting on the book
-func (ob *OrderBook) HasOrder(orderID uint64) bool {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-
-	_, exists := ob.Orders[orderID]
-	return exists
-}
-
 // validate checks admission rules. Caller must hold ob.mu.
 func (ob *OrderBook) validate(order *Order) error {
 	if order == nil {
@@ -251,16 +250,9 @@ func (ob *OrderBook) validate(order *Order) error {
 	return nil
 }
 
-// ProcessOrderWithWAL validates, persists (write + fsync) and matches an order under the book lock.
-func (ob *OrderBook) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
-	return ob.ProcessOrderWithWALNotify(order, wal, nil)
-}
-
-// ProcessOrderWithWALNotify is ProcessOrderWithWAL plus an optional notify callback.
-// notify runs while the book lock is still held, so events for one symbol are published
-// in exactly the order they executed. It is called only if the order produced trades or
-// left a resting remainder. notify must not call back into this OrderBook.
-func (ob *OrderBook) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify func(trades []*Trade, rested bool)) ([]*Trade, error) {
+// ProcessOrder validates and matches an order against resting liquidity in Price-Time (FIFO) priority.
+// Thread-safe: acquires ob.mu.
+func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
@@ -270,48 +262,34 @@ func (ob *OrderBook) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify fu
 
 	ob.seenOrders[order.ID] = struct{}{}
 
-	// LogPlace writes AND fsyncs; it returns an error wrapping ErrWAL on any failure,
-	// in which case nothing is applied to the book.
-	if wal != nil {
-		if err := wal.LogPlace(order); err != nil {
+	if ob.wal != nil {
+		if err := ob.wal.LogPlace(order); err != nil {
 			delete(ob.seenOrders, order.ID)
 			return nil, err
 		}
 	}
 
-	var trades []*Trade
 	if order.Side == Buy {
-		trades = ob.matchBuyOrder(order)
-	} else {
-		trades = ob.matchSellOrder(order)
+		return ob.matchBuyOrder(order), nil
 	}
-
-	rested := order.Type == Limit && order.Amount > 0
-	if notify != nil && (len(trades) > 0 || rested) {
-		notify(trades, rested)
-	}
-	return trades, nil
+	return ob.matchSellOrder(order), nil
 }
 
-// ProcessOrder is the thread-safe entry point to submit an order without WAL
-func (ob *OrderBook) ProcessOrder(order *Order) ([]*Trade, error) {
-	return ob.ProcessOrderWithWAL(order, nil)
-}
-
-// CancelOrderWithWAL cancels a resting order with WAL persistence under the book lock.
-func (ob *OrderBook) CancelOrderWithWAL(orderID uint64, wal *WAL) (bool, error) {
-	return ob.CancelOrderWithWALNotify(orderID, wal, nil)
-}
-
-// CancelOrderWithWALNotify is CancelOrderWithWAL plus a notify callback run under the book lock
-// after a successful cancel.
-func (ob *OrderBook) CancelOrderWithWALNotify(orderID uint64, wal *WAL, notify func()) (bool, error) {
+// CancelOrder removes an active resting order from the book by its ID.
+// Runs in O(log P) time to find the price level and O(1) to unlink the order.
+func (ob *OrderBook) CancelOrder(orderID uint64) error {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
 
 	order, exists := ob.Orders[orderID]
 	if !exists {
-		return false, fmt.Errorf("%w: %d", ErrOrderNotFound, orderID)
+		return fmt.Errorf("%w: %d", ErrOrderNotFound, orderID)
+	}
+
+	if ob.wal != nil {
+		if err := ob.wal.LogCancel(ob.Symbol, orderID); err != nil {
+			return err
+		}
 	}
 
 	var level *PriceLevel
@@ -334,41 +312,23 @@ func (ob *OrderBook) CancelOrderWithWALNotify(orderID uint64, wal *WAL, notify f
 		}
 	}
 
-	if level == nil {
-		delete(ob.Orders, orderID)
-		return false, fmt.Errorf("%w: order %d not found in price level", ErrOrderNotFound, orderID)
-	}
-
-	if wal != nil {
-		if err := wal.LogCancel(ob.Symbol, orderID); err != nil {
-			return false, err
-		}
-	}
-
-	level.RemoveOrder(order)
-	if level.IsEmpty() {
-		if isBuy {
-			copy(ob.Bids[levelIdx:], ob.Bids[levelIdx+1:])
-			ob.Bids[len(ob.Bids)-1] = nil // Avoid memory leak in backing array
-			ob.Bids = ob.Bids[:len(ob.Bids)-1]
-		} else {
-			copy(ob.Asks[levelIdx:], ob.Asks[levelIdx+1:])
-			ob.Asks[len(ob.Asks)-1] = nil // Avoid memory leak in backing array
-			ob.Asks = ob.Asks[:len(ob.Asks)-1]
+	if level != nil {
+		level.RemoveOrder(order)
+		if level.IsEmpty() {
+			if isBuy {
+				copy(ob.Bids[levelIdx:], ob.Bids[levelIdx+1:])
+				ob.Bids[len(ob.Bids)-1] = nil
+				ob.Bids = ob.Bids[:len(ob.Bids)-1]
+			} else {
+				copy(ob.Asks[levelIdx:], ob.Asks[levelIdx+1:])
+				ob.Asks[len(ob.Asks)-1] = nil
+				ob.Asks = ob.Asks[:len(ob.Asks)-1]
+			}
 		}
 	}
 
 	delete(ob.Orders, orderID)
-	if notify != nil {
-		notify()
-	}
-	return true, nil
-}
-
-// CancelOrder is the thread-safe entry point to cancel an existing order by ID without WAL
-func (ob *OrderBook) CancelOrder(orderID uint64) bool {
-	ok, _ := ob.CancelOrderWithWAL(orderID, nil)
-	return ok
+	return nil
 }
 
 // TopOfBook returns the best bid and best ask independently.
@@ -400,18 +360,6 @@ func (ob *OrderBook) GetSnapshot() ([]PriceLevelSummary, []PriceLevelSummary) {
 	}
 
 	return bids, asks
-}
-
-// GetBestBidAsk returns the top-of-book best bid and best ask prices thread-safely
-func (ob *OrderBook) GetBestBidAsk() (bestBid uint64, bestAsk uint64, ok bool) {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
-
-	if len(ob.Bids) == 0 || len(ob.Asks) == 0 {
-		return 0, 0, false
-	}
-
-	return ob.Bids[0].Price, ob.Asks[0].Price, true
 }
 
 // OpenOrderSummary provides an immutable summary of a resting order

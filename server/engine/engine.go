@@ -6,17 +6,29 @@ import (
 	"sync/atomic"
 )
 
-// Engine manages multiple OrderBooks across different trading symbols
+// Engine manages multiple OrderBooks across different trading symbols.
+// It coordinates symbol routing, sequential order ID generation, and optional WAL persistence.
 type Engine struct {
 	mu          sync.RWMutex
 	orderBooks  map[string]*OrderBook
 	nextOrderID uint64
+	wal         *WAL
 }
 
 // NewEngine initializes an empty exchange engine
 func NewEngine() *Engine {
 	return &Engine{
 		orderBooks: make(map[string]*OrderBook),
+	}
+}
+
+// SetWAL configures Write-Ahead Logging across all registered symbols and future ones.
+func (e *Engine) SetWAL(wal *WAL) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.wal = wal
+	for _, ob := range e.orderBooks {
+		ob.SetWAL(wal)
 	}
 }
 
@@ -55,6 +67,9 @@ func (e *Engine) RegisterSymbol(symbol string) *OrderBook {
 	}
 
 	ob := NewOrderBook(symbol)
+	if e.wal != nil {
+		ob.SetWAL(e.wal)
+	}
 	e.orderBooks[symbol] = ob
 	return ob
 }
@@ -68,8 +83,8 @@ func (e *Engine) GetOrderBook(symbol string) (*OrderBook, bool) {
 	return ob, exists
 }
 
-// ProcessOrderWithWALNotify routes an order to its book. See OrderBook.ProcessOrderWithWALNotify.
-func (e *Engine) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify func(trades []*Trade, rested bool)) ([]*Trade, error) {
+// ProcessOrder routes an incoming order to its respective OrderBook.
+func (e *Engine) ProcessOrder(order *Order) ([]*Trade, error) {
 	if order == nil {
 		return nil, fmt.Errorf("%w: order cannot be nil", ErrInvalidOrder)
 	}
@@ -77,36 +92,16 @@ func (e *Engine) ProcessOrderWithWALNotify(order *Order, wal *WAL, notify func(t
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownSymbol, order.Symbol)
 	}
-	return ob.ProcessOrderWithWALNotify(order, wal, notify)
+	return ob.ProcessOrder(order)
 }
 
-// ProcessOrderWithWAL routes an order to its book with WAL persistence.
-func (e *Engine) ProcessOrderWithWAL(order *Order, wal *WAL) ([]*Trade, error) {
-	return e.ProcessOrderWithWALNotify(order, wal, nil)
-}
-
-// ProcessOrder routes an incoming order to its respective OrderBook without WAL
-func (e *Engine) ProcessOrder(order *Order) ([]*Trade, error) {
-	return e.ProcessOrderWithWAL(order, nil)
-}
-
-// CancelOrderWithWALNotify cancels an order in the given symbol's book.
-func (e *Engine) CancelOrderWithWALNotify(symbol string, orderID uint64, wal *WAL, notify func()) (bool, error) {
+// CancelOrder cancels an order for a given symbol by its ID.
+func (e *Engine) CancelOrder(symbol string, orderID uint64) error {
 	ob, exists := e.GetOrderBook(symbol)
 	if !exists {
-		return false, fmt.Errorf("%w: %q", ErrUnknownSymbol, symbol)
+		return fmt.Errorf("%w: %q", ErrUnknownSymbol, symbol)
 	}
-	return ob.CancelOrderWithWALNotify(orderID, wal, notify)
-}
-
-// CancelOrderWithWAL cancels an order with WAL persistence.
-func (e *Engine) CancelOrderWithWAL(symbol string, orderID uint64, wal *WAL) (bool, error) {
-	return e.CancelOrderWithWALNotify(symbol, orderID, wal, nil)
-}
-
-// CancelOrder cancels an order for a given symbol without WAL
-func (e *Engine) CancelOrder(symbol string, orderID uint64) (bool, error) {
-	return e.CancelOrderWithWAL(symbol, orderID, nil)
+	return ob.CancelOrder(orderID)
 }
 
 // GetOpenOrders retrieves all resting orders for a symbol

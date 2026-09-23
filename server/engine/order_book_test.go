@@ -125,9 +125,8 @@ func TestCancelOrder(t *testing.T) {
 	}
 
 	// Cancel it
-	success := ob.CancelOrder(1)
-	if !success {
-		t.Fatalf("expected cancel to succeed")
+	if err := ob.CancelOrder(1); err != nil {
+		t.Fatalf("expected cancel to succeed, got %v", err)
 	}
 
 	// Verify it's gone
@@ -138,9 +137,9 @@ func TestCancelOrder(t *testing.T) {
 		t.Errorf("expected 0 bid levels, got %d", len(ob.Bids))
 	}
 
-	// Cancelling again should return false
-	if ob.CancelOrder(1) {
-		t.Errorf("expected second cancel to return false")
+	// Cancelling again should return ErrOrderNotFound
+	if err := ob.CancelOrder(1); !errors.Is(err, ErrOrderNotFound) {
+		t.Errorf("expected second cancel to return ErrOrderNotFound, got %v", err)
 	}
 }
 
@@ -216,30 +215,31 @@ func BenchmarkProcessOrderWithWAL(b *testing.B) {
 	defer wal.Close()
 
 	ob := NewOrderBook("AAPL")
+	ob.SetWAL(wal)
 	nextID := uint64(1)
 	for i := 0; i < 1000; i++ {
-		_, _ = ob.ProcessOrderWithWAL(&Order{
+		_, _ = ob.ProcessOrder(&Order{
 			ID: nextID, Symbol: "AAPL", Side: Sell,
 			Price: uint64(100 + (i % 10)), Amount: 10, Timestamp: int64(i),
-		}, wal)
+		})
 		nextID++
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		trades, err := ob.ProcessOrderWithWAL(&Order{
+		trades, err := ob.ProcessOrder(&Order{
 			ID: nextID, Symbol: "AAPL", Side: Buy, Type: Limit,
 			Price: 105, Amount: 1, Timestamp: int64(i),
-		}, wal)
+		})
 		nextID++
 		if err != nil || len(trades) != 1 {
 			b.Fatalf("iteration %d: buy must match exactly one resting ask (err=%v, trades=%d)", i, err, len(trades))
 		}
 
-		if _, err := ob.ProcessOrderWithWAL(&Order{
+		if _, err := ob.ProcessOrder(&Order{
 			ID: nextID, Symbol: "AAPL", Side: Sell, Type: Limit,
 			Price: trades[0].Price, Amount: 1, Timestamp: int64(i),
-		}, wal); err != nil {
+		}); err != nil {
 			b.Fatal(err)
 		}
 		nextID++
@@ -331,7 +331,7 @@ func TestConcurrentOrders(t *testing.T) {
 				// Concurrently read snapshot and top-of-book
 				if i%10 == 0 {
 					ob.GetSnapshot()
-					ob.GetBestBidAsk()
+					ob.TopOfBook()
 				}
 
 				// Concurrently cancel some orders
@@ -440,9 +440,8 @@ func TestDuplicateOrderIDAfterCancellation(t *testing.T) {
 		t.Fatalf("unexpected error placing buy: %v", err)
 	}
 
-	ok := ob.CancelOrder(200)
-	if !ok {
-		t.Fatalf("unexpected failure cancelling order")
+	if err := ob.CancelOrder(200); err != nil {
+		t.Fatalf("unexpected failure cancelling order: %v", err)
 	}
 
 	if _, exists := ob.Orders[200]; exists {

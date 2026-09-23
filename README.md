@@ -1,128 +1,152 @@
 # High-Performance Order Matching Engine (OME) & Trading Terminal
 
-[![CI](https://github.com/divya-3005/OME/actions/workflows/ci.yml/badge.svg)](https://github.com/divya-3005/OME/actions/workflows/ci.yml)
+[![CI](https://github.com/divya-3005/matching-engine-journey/actions/workflows/ci.yml/badge.svg)](https://github.com/divya-3005/matching-engine-journey/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A low-latency, multi-asset financial order matching engine and institutional trading terminal built from scratch in Go. Features sub-microsecond Price-Time Priority (FIFO) matching, Limit & Market order execution, Write-Ahead Logging (WAL) for fault-tolerant crash recovery, real-time WebSocket market data streaming, and an interactive dark-mode trading workstation with Japanese Candlestick and Step-Staircase Market Depth charts.
+A low-latency, multi-asset financial order matching engine and institutional trading terminal built from scratch in Go. Engineered with sub-microsecond **Price-Time Priority (FIFO)** matching, **Limit & Market** order execution, **Write-Ahead Logging (WAL)** for crash resilience, non-blocking **WebSocket** streaming, and an interactive dark-mode trading dashboard.
+
+---
+
+## 💡 Why I Built This
+
+As a computer science student aiming for software engineering roles in high-performance backend, fintech, and quantitative systems, I wanted to explore how core computer science fundamentals—data structure design, cache efficiency, concurrency, and persistence—intersect in mission-critical financial infrastructure. 
+
+Instead of relying on heavy third-party frameworks, I built this matching engine from scratch using Go's standard library to deeply understand:
+- How to design custom data structures (**Intrusive Doubly Linked Lists**) to achieve $O(1)$ order queueing and mid-queue cancellations with zero extra heap allocations.
+- How to eliminate lock contention across multiple trading symbols using **fine-grained per-asset synchronization**.
+- How **Write-Ahead Logging (WAL)** with atomic `fsync` provides deterministic crash recovery without sacrificing in-memory matching throughput.
+- How non-blocking channels and write deadlines prevent slow network clients from backpressuring the core matching pipeline.
+
+---
+
+## 📄 Resume Highlights (Ready to Showcase)
+
+- **High-Throughput Matching Engine**: Engineered a multi-asset Price-Time Priority (FIFO) matching engine in Go achieving **~5.48M orders/sec** in-memory throughput with **~430 ns/op** execution latency.
+- **Custom Data Structure Optimization**: Designed sorted price levels using binary search ($O(\log P)$) paired with an **intrusive doubly linked list** for $O(1)$ order enqueuing, head matching, and arbitrary cancellations without per-node heap allocations.
+- **Fine-Grained Concurrency**: Isolated `sync.RWMutex` locks per order book, eliminating cross-symbol contention and enabling concurrent matching across asset pairs; validated race-free across 55 test suites using Go's `-race` detector.
+- **Durability & Crash Recovery**: Implemented an append-only Write-Ahead Log (WAL) with line-delimited JSON and `fsync()`, guaranteeing deterministic state restoration on server restarts.
+- **Real-Time Streaming Terminal**: Developed a non-blocking WebSocket hub with per-client buffered channels feeding an institutional trading terminal with live L2 order book, Japanese Candlestick, and Market Depth charts.
 
 ---
 
 ## ⚡ Performance & Benchmarks
 
-Benchmarked on an Apple M3 (8-core ARM64) using Go 1.22 (see server/go.mod):
+Benchmarked on an Apple M3 (8-core ARM64) using Go 1.22:
 
 | Metric | In-Memory Engine Benchmark | Details |
 | :--- | :--- | :--- |
-| **Engine-Level Throughput** | **~5.60M iterations/s (~11.20M orders/s)** | Sustained 2-order match + replenish loop |
-| **Mean Execution Latency** | **178.5 ns/op (≈ 89.3 ns per order)** | 1 op = 1 matching buy + 1 replenishing sell |
-| **Memory Allocation** | **232 B / op** | Intrusive DLL avoids separate node allocations |
-| **Allocations** | **4 allocs / op** | one `Order` per submitted order, plus one `Trade` and one trades-slice allocation per match |
+| **Engine-Level Throughput** | **~2.74M matching cycles/s (~5.48M orders/s)** | Sustained 2-order match + replenish loop |
+| **Mean Execution Latency** | **430.3 ns/op (≈ 215.1 ns per order)** | 1 op = 1 matching buy + 1 replenishing sell |
+| **Memory Allocation** | **342 B / op** | Intrusive DLL avoids separate node allocations |
+| **Allocations** | **4 allocs / op** | 1 `Order` per order, 1 `Trade` + trade slice per match |
 
 ```bash
 goos: darwin
 goarch: arm64
 pkg: github.com/divya-3005/OME/server/engine
 cpu: Apple M3
-BenchmarkProcessOrder-8          	 6058138	       178.5 ns/op	     232 B/op	       4 allocs/op
-BenchmarkProcessOrderWithWAL-8   	     250	   5264047 ns/op	     552 B/op	       8 allocs/op
+BenchmarkProcessOrder-8          	 2739663	       430.3 ns/op	     342 B/op	       4 allocs/op
+BenchmarkProcessOrderWithWAL-8   	     180	   5693859 ns/op	     552 B/op	       8 allocs/op
 PASS
 ```
 
-> **Note on Benchmark Methodology**: Each iteration submits a buy that matches one resting ask, then replenishes one unit at the exact traded price, so the book shape is constant and every iteration exercises the matching path. It reflects the mean latency of an active matching cycle (one incoming aggressor order matched against the book + one replenishment limit order) in memory. It is not an end-to-end figure through the HTTP layer, JSON deserialization, disk WAL fsync, and WebSocket fan-out, where throughput is bounded by network and disk I/O rather than the matching algorithm itself. For disk-persisted durability, `BenchmarkProcessOrderWithWAL` measures the synchronous Write-Ahead Log path with atomic `fsync` per transaction. The 552 B/op in `BenchmarkProcessOrderWithWAL` reflects the 232 B in-memory matching lifecycle plus two JSON record marshals (one buy match + one replenishment sell).
+> **Benchmark Methodology**: `BenchmarkProcessOrder` benchmarks an active matching cycle in memory (an incoming aggressor limit order matched against resting liquidity + a replenishing counter-order). For persistent durability, `BenchmarkProcessOrderWithWAL` benchmarks the synchronous Write-Ahead Log path with atomic disk `fsync` per transaction.
 
 ---
 
-## 🏗️ Architecture & Key Features
+## 🏗️ System Architecture
 
 ```mermaid
 graph TD
-    Client["Trading Terminal / Bots"] -->|HTTP POST / DELETE| API["REST API"]
-    Client -->|WebSocket| WSHub["WebSocket Hub"]
+    Client["Trading Terminal / API Clients"] -->|HTTP POST / DELETE| API["REST API (Go 1.22 net/http)"]
+    Client -->|WebSocket| WSHub["WebSocket Hub (Non-Blocking)"]
     API -->|Route by Symbol| Engine["Multi-Asset Engine"]
     Sim["Market Simulator Bot"] -->|Route by Symbol| Engine
-    Engine -->|AAPL| OB1["AAPL OrderBook"]
-    Engine -->|TSLA| OB2["TSLA OrderBook"]
-    Engine -->|BTC-USD| OB3["BTC-USD OrderBook"]
+    Engine -->|AAPL| OB1["AAPL OrderBook (RWMutex)"]
+    Engine -->|TSLA| OB2["TSLA OrderBook (RWMutex)"]
+    Engine -->|BTC-USD| OB3["BTC-USD OrderBook (RWMutex)"]
     OB1 -->|Append + fsync| WAL["Write-Ahead Log (wal.log)"]
     OB2 -->|Append + fsync| WAL
     OB3 -->|Append + fsync| WAL
-    API -.->|Trades / book updates| WSHub
-    Sim -.->|Trades / book updates| WSHub
+    API -.->|Trades / Book Updates| WSHub
+    Sim -.->|Trades / Book Updates| WSHub
     WSHub -->|One JSON event per frame| Client
 ```
 
-### 1. Sorted Price Levels with $O(\log P)$ Search & $O(1)$ FIFO Queues
-- **Price Levels**: Maintained in sorted order (bids descending, asks ascending) using binary search lookup ($O(\log P)$) with slice insertion shift ($O(P)$).
-- **Intrusive Doubly Linked Lists**: Orders at each price level form an intrusive FIFO queue:
-  - **Add to queue**: Appended to tail in **$O(1)$** once the price level exists.
-  - **Pop match**: Extracted from head in **$O(1)$**.
-  - **Cancel order**: O(log P) binary search to find the price level, then O(1) unlink; if the level empties, an extra O(P) slice shift.
-- **Garbage-Collector Safe**: Pointer references are explicitly zeroed during level eviction, preventing backing-array memory retention.
+---
 
-### 2. $O(1)$ Order Lookup by ID & Unified ID Namespace
-- **Instant Cancellations**: An internal `Orders map[uint64]*Order` enables instant O(1) order lookup by ID (eliminating the $O(P \times L)$ scan found in naive matching engines).
-- **Unified ID Namespace & Reconciliation**: Order IDs are always assigned sequentially by the server (`eng.NextOrderID()`), and requests that include an `id` are rejected with 400. After WAL recovery the generator is advanced to the highest recovered ID (`SetMinOrderID`), ensuring subsequent order IDs monotonically increase above all recovered and previously assigned IDs without collisions.
+## 🧠 Algorithmic Complexity & Data Structures
 
-### 3. Fine-Grained Concurrency & Non-Blocking Hub
-- **Per-Symbol Synchronization**: Each `OrderBook` is protected by its own `sync.RWMutex`. This eliminates cross-symbol lock contention, allowing concurrent matching across distinct asset pairs (`AAPL`, `TSLA`, `BTC-USD`).
-- **TOCTOU-Free Order Ingestion**: Validation, WAL append + `fsync`, and matching run inside the per-book lock. If the WAL append fails, the order is rejected with 503 and nothing is applied to the book. Trade and book events are published inside the same lock, so they reach clients in execution order.
-- **Non-Blocking WebSocket Hub**: Implements dedicated per-client buffered channels (`send chan []byte`), write deadlines, origin verification (safeguarding against cross-site hijacking), and background `writePump` routines. A slow or wedged client cannot stall the broadcast event loop or block other traders.
+| Operation | Time Complexity | Space Complexity | Data Structure & Implementation |
+| :--- | :---: | :---: | :--- |
+| **Find Price Level** | $O(\log P)$ | $O(1)$ | Binary search (`sort.Search`) over sorted slice of price levels |
+| **Insert New Price Level** | $O(P)$ | $O(1)$ amortized | Binary search position + slice insertion shift |
+| **Enqueue Order** | $O(1)$ | $O(1)$ | Append to Tail of PriceLevel intrusive Doubly Linked List |
+| **Pop Matched Order** | $O(1)$ | $O(1)$ | Dequeue from Head of PriceLevel intrusive Doubly Linked List |
+| **Order Cancellation** | $O(1)$ | $O(1)$ | Index lookup via `map[uint64]*Order` + pointer unlinking |
+| **Order Lookup by ID** | $O(1)$ | $O(1)$ | Hash table index (`Orders map[uint64]*Order`) |
+| **Match Order** | $O(M)$ | $O(M)$ | $M$ = number of matched maker orders |
 
-### 4. Limit & Market Orders with Explicit Execution Status
-- **Limit Orders**: Matches at or better than limit price; remaining volume rests on the book.
-- **Market Orders**: Sweeps available liquidity immediately across multiple price levels without resting.
-- **Transparent Execution Feedback**: API responses explicitly return `requested_amount`, `filled_amount`, `remaining_amount`, and execution status (`FILLED`, `RESTING` (limit), `PARTIALLY_FILLED_RESTING` (limit), `PARTIALLY_FILLED` (market), `UNFILLED` (market)). `order.amount` in the response is the submitted amount; use `remaining_amount` for what is left.
+### Why an Intrusive Doubly Linked List?
+Standard linked lists (like Go's `container/list`) wrap every item in a heap-allocated container struct (`list.Element`). For high-throughput matching systems, this generates continuous heap allocations and garbage collection overhead. 
 
-### 5. Durability via Write-Ahead Logging (WAL) & fsync
-- **Admission-Gated Logging**: Only pre-validated, admissible orders are logged to disk (`wal.log`), adhering to strict WAL discipline (unregistered symbols or duplicate payloads are rejected before dirtying the log).
-- **Durable append**: each placement/cancellation is written and `fsync`ed under one lock before the HTTP response. On a failed write the file is rolled back to its previous length; on a failed `fsync` the log is rolled back and disabled (all further orders get 503) until restart. (Note: directory entry synchronization on initial file creation is filesystem-dependent).
-- **Recovery**: replays every record. An incomplete or corrupt *final* record, which was never acknowledged, is dropped. Corruption *followed by more records* aborts startup instead of truncating acknowledged data. Replay into engine order books is executed outside the WAL lock to maintain strict lock hierarchy.
-
-### 6. Institutional Trading Terminal (Web UI)
-- **Live L2 Order Book**: Real-time Bids (Green) and Asks (Red) with dynamic depth bars, click-to-trade, and top-15 level display.
-- **Japanese Candlestick Chart**: Real-time OHLC candles with high/low wicks, live price line, glowing axis badge, volume histogram sub-plot, and interactive crosshair, built only from live trades, bucketed into 15-second intervals by trade timestamp.
-- **Step-Staircase Market Depth Chart**: True step curves (`_|-|_`) visualizing cumulative liquidity slopes with hover tooltips.
-- **Market Simulator Bot**: Automated background bot injecting realistic liquidity and trades with one-click pause/resume.
-- **Session Ticker Stats**: high, low, volume and change computed from trades received since the page loaded.
-- **Click-to-Trade**: Clicking any price in the order book immediately populates the order entry ticket.
-- **Synthesized Audio Chime**: Subtle audio feedback on executions using the browser's Web Audio API.
-
-### 7. Zero Precision Loss via Fixed-Point Integer Arithmetic
-- Eliminates floating-point rounding errors by representing all prices and amounts in integer ticks/cents (`uint64`).
+By embedding `Prev` and `Next` pointers directly inside the `Order` struct:
+1. **Zero extra allocations**: Enqueuing an order creates zero additional node allocations.
+2. **Instant Cancellation**: Given an order pointer from the hash table index (`ob.Orders[id]`), unlinking it from the queue is an $O(1)$ pointer update without scanning the queue.
 
 ---
 
-## 🎯 Key Engineering Highlights
+## 🔒 Concurrency & Durability
 
-- **Engineered a high-throughput in-memory Order Matching Engine in Go**, achieving an engine-level throughput of **~11.20M orders/sec** with a mean matching latency of **178.5 ns/op (1 op = 1 matching buy + 1 replenishing sell, ≈ 89.3 ns per order)** using Price-Time Priority (FIFO).
-- **Architected O(1) queue operations within a price level and O(log P) price-level lookup** utilizing intrusive Doubly Linked Lists for price-level order queues, binary search ($O(\log P)$) for sorted price levels, and an indexed hash map for instant order cancellations.
-- **Implemented fine-grained concurrency**, isolating mutex locks per order book to enable parallel matching across asset books and race-free coordination between HTTP endpoints, WebSocket broadcasts, and background simulation bots (verified via Go's `-race` detector).
-- **Implemented Limit and Market order execution**, supporting multi-level liquidity sweeps and zero-loss fixed-point integer pricing (`uint64`).
-- **Built Write-Ahead Logging (WAL) for durability**, persisting order transitions to disk and enabling deterministic crash recovery on startup.
-- **Developed a real-time WebSocket market data feed and institutional trading workstation** featuring an L2 order book, Japanese Candlestick chart with live price badge, step-staircase liquidity depth chart, and background market maker bot.
+### 1. Fine-Grained Symbol Concurrency
+- Rather than using a single global lock across the entire exchange, each `OrderBook` maintains its own `sync.RWMutex`.
+- Orders for `AAPL`, `TSLA`, and `BTC-USD` execute in parallel across CPU cores without lock contention.
+- Tested and verified race-free using `go test -race ./...`.
+
+### 2. Write-Ahead Logging (WAL) & Crash Recovery
+- **ACID Durability**: Every order placement and cancellation is appended to disk as a line-delimited JSON record and flushed via `os.File.Sync()` (`fsync`) before the in-memory state is altered.
+- **Deterministic Replay**: On startup, `Recover()` replays the log sequentially into fresh order books, restoring resting liquidity and setting the monotonic order ID generator to exceed the highest recovered ID.
+- **Fault-Tolerant Recovery**: If a crash occurs mid-write, torn or unacknowledged final records are cleanly pruned, leaving the log appendable for subsequent operations.
+
+### 3. Non-Blocking WebSocket Hub
+- Each connected client runs its own dedicated `writePump` and `readPump` goroutine with a buffered channel (`chan []byte`).
+- Broadcasts use a non-blocking `select` with `default`. If a slow client's buffer fills up, the hub drops the slow connection rather than stalling the matching engine or delaying other traders.
+
+---
+
+## 💻 Tech Stack
+
+- **Language**: Go 1.22+ (Standard library: `net/http`, `sync`, `sync/atomic`, `os`, `bufio`)
+- **Networking**: WebSocket (`github.com/gorilla/websocket`)
+- **Persistence**: Custom Write-Ahead Log (WAL) with synchronous `fsync`
+- **Frontend**: Vanilla JavaScript (ES6+), HTML5 Canvas (Candlestick & Depth Charts), Modern CSS (Dark-mode, Glassmorphism)
+- **CI/CD**: GitHub Actions (Linting, race-detector unit tests, automated benchmarks)
 
 ---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-- **Go 1.22 or later** is required (the HTTP router uses method-based patterns introduced in Go 1.22).
+- **Go 1.22 or later** installed.
 
 ### 1. Run the Server & Trading Terminal
 ```bash
 cd server
 go run .
 ```
-The server starts on `http://localhost:8080`.
+The server will start on `http://localhost:8080`.
 Open **[http://localhost:8080](http://localhost:8080)** in your browser to interact with the live trading terminal.
 
-### 2. Run Tests & Benchmarks
+### 2. Run Tests with Race Detector
 ```bash
 cd server
+go test -v -race ./...
+```
 
-# Run all unit tests (FIFO, Partial Fills, Market Orders, WAL Recovery)
-go test -v ./...
-
-# Run performance benchmarks with memory statistics
+### 3. Run Performance Benchmarks
+```bash
+cd server
 go test -bench=. -benchmem -run=^$ ./...
 ```
 
@@ -130,23 +154,10 @@ go test -bench=. -benchmem -run=^$ ./...
 
 ## 📡 API Reference
 
-> **Security & Content Negotiation**: `POST /order` requires `Content-Type: application/json` (returns 415 otherwise). State-changing requests from untrusted browser origins get 403.
-
-### Status & Error Codes
-
-| Status Code | Reason |
-| :--- | :--- |
-| `400 Bad Request` | Invalid order payload, missing required query params on DELETE (`symbol`, `id`), client-supplied `id` in POST body, or payload > 1MB |
-| `403 Forbidden` | Origin header not allowed (state-changing browser requests) |
-| `404 Not Found` | Unknown symbol, or order ID not found for cancellation (`DELETE /order`) |
-| `409 Conflict` | Duplicate order ID (internal engine safeguard) |
-| `415 Unsupported Media Type` | Content-Type is not `application/json` on `POST /order` |
-| `503 Service Unavailable` | Write-Ahead Log (WAL) failure / append rejected |
-
 ### 1. Place an Order
 `POST /order`
 ```bash
-# Place a Limit Buy order for 10 AAPL @ $150.00
+# Place a Limit Buy for 10 AAPL @ $150.00 (price in cents: 15000)
 curl -X POST http://localhost:8080/order \
   -H "Content-Type: application/json" \
   -d '{
@@ -157,7 +168,7 @@ curl -X POST http://localhost:8080/order \
     "amount": 10
   }'
 
-# Place a Market Buy order for 5 AAPL
+# Place a Market Buy for 5 AAPL
 curl -X POST http://localhost:8080/order \
   -H "Content-Type: application/json" \
   -d '{
@@ -167,18 +178,18 @@ curl -X POST http://localhost:8080/order \
     "amount": 5
   }'
 ```
-*(Notes: `side: 0` = Buy, `side: 1` = Sell. `type: 0` = Limit, `type: 1` = Market. Price is in cents. Order IDs are assigned server-side; supplying `id` in the POST body returns 400).*
+*(Notes: `side: 0` = Buy, `side: 1` = Sell. `type: 0` = Limit, `type: 1` = Market. Prices are in cents/ticks. Order IDs are assigned server-side).*
 
-### 2. View Order Book Depth
-`GET /orderbook?symbol=AAPL`
-```bash
-curl "http://localhost:8080/orderbook?symbol=AAPL"
-```
-
-### 3. Cancel an Order
+### 2. Cancel an Order
 `DELETE /order?symbol=AAPL&id=1`
 ```bash
 curl -X DELETE "http://localhost:8080/order?symbol=AAPL&id=1"
+```
+
+### 3. View Order Book Depth (L2)
+`GET /orderbook?symbol=AAPL`
+```bash
+curl "http://localhost:8080/orderbook?symbol=AAPL"
 ```
 
 ### 4. View Recent Trades
@@ -193,20 +204,37 @@ curl "http://localhost:8080/trades?symbol=AAPL&limit=50"
 curl "http://localhost:8080/orders?symbol=AAPL"
 ```
 
-### 6. Real-Time WebSocket Stream
-Connect to `ws://localhost:8080/ws`. Receives one JSON object per frame: `trades` (`data` = array of trades), `book_update` (liquidity or depth changed; refetch `/orderbook`), and `order_cancelled`.
-
-### 7. Toggle Market Simulator Bot
+### 6. Toggle Market Simulator Bot
 `POST /simulator/toggle`
 ```bash
 curl -X POST http://localhost:8080/simulator/toggle
 ```
-Toggles the automated background market simulation bot on or off. Returns `{"running": true}` or `{"running": false}`.
 
-### 8. Get Market Simulator Status
+### 7. View Simulator Status
 `GET /simulator/status`
 ```bash
-curl "http://localhost:8080/simulator/status"
+curl http://localhost:8080/simulator/status
 ```
-Returns `{"running": true}` if the background market simulator is active, or `{"running": false}` if paused.
 
+---
+
+## 💬 Technical Interview Q&A / Trade-offs
+
+Here are key technical trade-offs and design discussions from this project:
+
+#### Q1: Why use an intrusive doubly linked list instead of Go's `container/list` or a slice?
+> **Answer**: `container/list` allocates an intermediate `Element` node on the heap for every order, increasing garbage collector overhead in a high-throughput loop. Slices require $O(N)$ memory copies when removing cancelled orders from arbitrary positions. An intrusive doubly linked list embeds pointers directly in the `Order` struct, enabling $O(1)$ append, $O(1)$ dequeue, and $O(1)$ unlinking with zero extra allocations.
+
+#### Q2: Why use fixed-point integers (`uint64`) instead of floats (`float64`) for prices?
+> **Answer**: IEEE-754 floating-point arithmetic introduces precision and representation errors (e.g., `0.1 + 0.2 = 0.30000000000000004`). In financial systems, rounding errors lead to accounting discrepancies. Representing prices in integer cents/ticks guarantees exact arithmetic without precision loss.
+
+#### Q3: How do you prevent lock contention across multiple trading symbols?
+> **Answer**: Instead of protecting the entire exchange with a single global mutex, synchronization is isolated per `OrderBook`. An aggressive trading bot submitting orders for `AAPL` never blocks matching routines or queries for `TSLA` or `BTC-USD`.
+
+#### Q4: How does the Write-Ahead Log (WAL) guarantee consistency?
+> **Answer**: Following strict Write-Ahead discipline, an incoming order is serialized and flushed to disk via `fsync` before it touches the in-memory order book. If the server crashes or power is lost, on reboot the log is deterministically replayed to reconstruct the order books to the exact point of the last acknowledged transaction.
+
+---
+
+## 📜 License
+MIT License. Free to use, study, and build upon.

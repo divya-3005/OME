@@ -13,6 +13,21 @@ import (
 	"sync"
 )
 
+// Write-Ahead Logging (WAL) Module
+//
+// Engineering Design Note (Durability & Fault Tolerance):
+// To achieve ACID Durability without sacrificing in-memory matching speed,
+// every order placement and cancellation is serialized as a line-delimited
+// JSON record and flushed to persistent storage via fsync() BEFORE the in-memory
+// order book state is modified.
+//
+// Crash Recovery Guarantee:
+// On engine restart, Recover() sequentially replays all valid records to
+// reconstruct the exact state of all order books deterministically.
+// If an ungraceful crash interrupted a write (creating an incomplete or
+// unacknowledged final record), it is safely truncated, and the engine
+// resumes normal operations without data corruption.
+
 // WALEntry represents a single logged event in the Write-Ahead Log.
 type WALEntry struct {
 	Action  string `json:"action"` // "PLACE" or "CANCEL"
@@ -231,7 +246,7 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 			if entry.OrderID > maxOrderID {
 				maxOrderID = entry.OrderID
 			}
-			if _, err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
+			if err := eng.CancelOrder(entry.Symbol, entry.OrderID); err != nil {
 				return maxOrderID, fmt.Errorf("WAL recovery: failed replaying cancel for order %d: %w", entry.OrderID, err)
 			}
 		}
@@ -239,14 +254,6 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 
 	eng.SetMinOrderID(maxOrderID)
 	return maxOrderID, nil
-}
-
-// Sync commits the current contents of the WAL file to stable storage.
-// (LogPlace/LogCancel already fsync; this is kept for API compatibility.)
-func (w *WAL) Sync() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.file.Sync()
 }
 
 // Close closes the WAL file.

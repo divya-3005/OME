@@ -58,19 +58,18 @@ func main() {
 		log.Fatalf("WAL recovery failed, refusing to start: %v", err)
 	}
 	log.Printf("WAL recovery complete: restored state (highest order ID: %d)", maxID)
+	eng.SetWAL(wal)
 
-	sim := NewMarketSimulator(eng, hub, wal)
-	for _, sym := range supportedSymbols {
-		sim.EnsureLiquidity(sym)
-	}
+	sim := NewMarketSimulator(eng, hub)
+	sim.SeedMarket()
 	sim.Start()
 	log.Println("Market Simulator active: simulating live institutional order flow")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("OPTIONS /order", handleOptions)
 	mux.HandleFunc("OPTIONS /simulator/toggle", handleOptions)
-	mux.HandleFunc("POST /order", requireAllowedOrigin(handlePlaceOrder(eng, hub, wal)))
-	mux.HandleFunc("DELETE /order", requireAllowedOrigin(handleCancelOrder(eng, hub, wal)))
+	mux.HandleFunc("POST /order", requireAllowedOrigin(handlePlaceOrder(eng, hub)))
+	mux.HandleFunc("DELETE /order", requireAllowedOrigin(handleCancelOrder(eng, hub)))
 	mux.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
 	mux.HandleFunc("GET /trades", handleGetTrades(eng, hub))
 	mux.HandleFunc("GET /orders", handleGetOrders(eng))
@@ -184,24 +183,21 @@ func writeEngineError(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), status)
 }
 
-// publishOrderEvents returns a notify callback that broadcasts trades and book updates.
-// It runs under the order book lock, so events are published in execution order.
-func publishOrderEvents(hub *Hub, symbol string) func([]*engine.Trade, bool) {
-	return func(trades []*engine.Trade, rested bool) {
-		if len(trades) > 0 {
-			hub.RecordTrades(symbol, trades)
-			hub.BroadcastJSON(map[string]interface{}{
-				"type":   "trades",
-				"symbol": symbol,
-				"data":   trades,
-			})
-		}
-		if len(trades) > 0 || rested {
-			hub.BroadcastJSON(map[string]interface{}{
-				"type":   "book_update",
-				"symbol": symbol,
-			})
-		}
+// publishOrderEvents broadcasts executed trades and order book updates to WebSocket clients.
+func publishOrderEvents(hub *Hub, symbol string, trades []*engine.Trade, rested bool) {
+	if len(trades) > 0 {
+		hub.RecordTrades(symbol, trades)
+		hub.BroadcastJSON(map[string]interface{}{
+			"type":   "trades",
+			"symbol": symbol,
+			"data":   trades,
+		})
+	}
+	if len(trades) > 0 || rested {
+		hub.BroadcastJSON(map[string]interface{}{
+			"type":   "book_update",
+			"symbol": symbol,
+		})
 	}
 }
 
@@ -230,7 +226,7 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 }
 
 // handlePlaceOrder processes POST /order.
-func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
+func handlePlaceOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !isJSONRequest(r) {
 			http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
@@ -253,7 +249,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 		order.Timestamp = time.Now().UnixMilli()
 
 		submitted := order // snapshot before matching mutates Amount
-		trades, err := eng.ProcessOrderWithWALNotify(&order, wal, publishOrderEvents(hub, order.Symbol))
+		trades, err := eng.ProcessOrder(&order)
 		if err != nil {
 			writeEngineError(w, err)
 			return
@@ -264,6 +260,9 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 			filledAmount += t.Amount
 		}
 		remainingAmount := submitted.Amount - filledAmount
+
+		// Broadcast trade executions and book updates to WebSocket clients
+		publishOrderEvents(hub, order.Symbol, trades, remainingAmount > 0 && order.Type == engine.Limit)
 
 		status := "FILLED"
 		if remainingAmount > 0 {
@@ -295,7 +294,7 @@ func handlePlaceOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handle
 }
 
 // handleCancelOrder processes DELETE /order?symbol=AAPL&id=1.
-func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.HandlerFunc {
+func handleCancelOrder(eng *engine.Engine, hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		symbol := r.URL.Query().Get("symbol")
 		idStr := r.URL.Query().Get("id")
@@ -311,25 +310,24 @@ func handleCancelOrder(eng *engine.Engine, hub *Hub, wal *engine.WAL) http.Handl
 			return
 		}
 
-		success, err := eng.CancelOrderWithWALNotify(symbol, orderID, wal, func() {
-			hub.BroadcastJSON(map[string]interface{}{
-				"type":     "order_cancelled",
-				"symbol":   symbol,
-				"order_id": orderID,
-			})
-			hub.BroadcastJSON(map[string]interface{}{
-				"type":   "book_update",
-				"symbol": symbol,
-			})
-		})
-		if err != nil {
+		if err := eng.CancelOrder(symbol, orderID); err != nil {
 			writeEngineError(w, err)
 			return
 		}
 
+		hub.BroadcastJSON(map[string]interface{}{
+			"type":     "order_cancelled",
+			"symbol":   symbol,
+			"order_id": orderID,
+		})
+		hub.BroadcastJSON(map[string]interface{}{
+			"type":   "book_update",
+			"symbol": symbol,
+		})
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":  success,
+			"success":  true,
 			"order_id": orderID,
 		})
 	}

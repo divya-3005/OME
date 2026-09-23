@@ -12,7 +12,6 @@ import (
 type MarketSimulator struct {
 	eng *engine.Engine
 	hub *Hub
-	wal *engine.WAL
 
 	mu      sync.Mutex
 	running bool
@@ -20,8 +19,8 @@ type MarketSimulator struct {
 	done    chan struct{} // closed by the current run's goroutine when it exits
 }
 
-func NewMarketSimulator(eng *engine.Engine, hub *Hub, wal *engine.WAL) *MarketSimulator {
-	return &MarketSimulator{eng: eng, hub: hub, wal: wal}
+func NewMarketSimulator(eng *engine.Engine, hub *Hub) *MarketSimulator {
+	return &MarketSimulator{eng: eng, hub: hub}
 }
 
 func referenceMid(symbol string) (uint64, bool) {
@@ -69,8 +68,11 @@ func (sim *MarketSimulator) placeLadder(symbol string, side engine.Side, anchor 
 			Amount:    uint64(5 + rand.Intn(25)),
 			Timestamp: time.Now().UnixMilli(),
 		}
-		if _, err := sim.eng.ProcessOrderWithWALNotify(order, sim.wal, publishOrderEvents(sim.hub, symbol)); err != nil {
+		trades, err := sim.eng.ProcessOrder(order)
+		if err != nil {
 			log.Printf("simulator: failed to place ladder order %d for %s: %v", order.ID, symbol, err)
+		} else {
+			publishOrderEvents(sim.hub, symbol, trades, order.Type == engine.Limit && order.Amount > 0)
 		}
 	}
 }
@@ -269,7 +271,10 @@ func (sim *MarketSimulator) step() {
 		Amount:    qty,
 		Timestamp: time.Now().UnixMilli(),
 	}
-	if _, err := sim.eng.ProcessOrderWithWALNotify(order, sim.wal, publishOrderEvents(sim.hub, symbol)); err != nil {
+	trades, err := sim.eng.ProcessOrder(order)
+	if err != nil {
 		log.Printf("simulator: order %d rejected: %v", order.ID, err)
+		return
 	}
+	publishOrderEvents(sim.hub, symbol, trades, order.Type == engine.Limit && order.Amount > 0)
 }

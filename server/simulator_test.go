@@ -2,41 +2,30 @@ package main
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/divya-3005/OME/server/engine"
 )
 
-func setupTestSimulator(t *testing.T) (*MarketSimulator, *engine.Engine, *Hub, *engine.WAL, func()) {
+func setupTestSimulator(t *testing.T) (*MarketSimulator, *engine.Engine, *Hub, func()) {
 	t.Helper()
 	eng := engine.NewEngine()
 	hub := NewHub()
 	go hub.Run()
 
-	tempDir := t.TempDir()
-	walPath := filepath.Join(tempDir, "sim_test_wal.log")
-	wal, err := engine.OpenWAL(walPath)
-	if err != nil {
-		t.Fatalf("failed to open test WAL: %v", err)
-	}
-
-	sim := NewMarketSimulator(eng, hub, wal)
+	sim := NewMarketSimulator(eng, hub)
 
 	cleanup := func() {
-		sim.Stop() // waits for the goroutine to exit before the WAL is closed
+		sim.Stop()
 		hub.Stop()
-		wal.Close()
-		os.Remove(walPath)
 	}
 
-	return sim, eng, hub, wal, cleanup
+	return sim, eng, hub, cleanup
 }
 
 func TestSimulatorSeedSymbol(t *testing.T) {
-	sim, eng, _, _, cleanup := setupTestSimulator(t)
+	sim, eng, _, cleanup := setupTestSimulator(t)
 	defer cleanup()
 
 	eng.RegisterSymbol("AAPL")
@@ -67,7 +56,7 @@ func TestSimulatorSeedSymbol(t *testing.T) {
 }
 
 func TestSimulatorSeedMarket(t *testing.T) {
-	sim, eng, _, _, cleanup := setupTestSimulator(t)
+	sim, eng, _, cleanup := setupTestSimulator(t)
 	defer cleanup()
 
 	for _, sym := range []string{"AAPL", "TSLA", "BTC-USD"} {
@@ -89,7 +78,7 @@ func TestSimulatorSeedMarket(t *testing.T) {
 }
 
 func TestSimulatorStartStopToggle(t *testing.T) {
-	sim, _, _, _, cleanup := setupTestSimulator(t)
+	sim, _, _, cleanup := setupTestSimulator(t)
 	defer cleanup()
 
 	if sim.IsRunning() {
@@ -116,7 +105,7 @@ func TestSimulatorStartStopToggle(t *testing.T) {
 }
 
 func TestSimulatorLiveOrderExecution(t *testing.T) {
-	sim, eng, hub, _, cleanup := setupTestSimulator(t)
+	sim, eng, hub, cleanup := setupTestSimulator(t)
 	defer cleanup()
 
 	for _, sym := range []string{"AAPL", "TSLA", "BTC-USD"} {
@@ -157,7 +146,7 @@ func TestSimulatorLiveOrderExecution(t *testing.T) {
 }
 
 func TestSimulatorRapidToggleIsRaceFree(t *testing.T) {
-	sim, eng, _, _, cleanup := setupTestSimulator(t)
+	sim, eng, _, cleanup := setupTestSimulator(t)
 	defer cleanup()
 	for _, sym := range supportedSymbols {
 		eng.RegisterSymbol(sym)
@@ -172,7 +161,7 @@ func TestSimulatorRapidToggleIsRaceFree(t *testing.T) {
 }
 
 func TestSimulatorRefillsEmptySide(t *testing.T) {
-	sim, eng, _, _, cleanup := setupTestSimulator(t)
+	sim, eng, _, cleanup := setupTestSimulator(t)
 	defer cleanup()
 	eng.RegisterSymbol("AAPL")
 	sim.placeLadder("AAPL", engine.Buy, 15000) // bids only, asks empty
@@ -190,13 +179,13 @@ func TestSimulatorRefillsEmptySide(t *testing.T) {
 }
 
 func TestSimulatorNarrowsWideSpread(t *testing.T) {
-	sim, eng, _, wal, cleanup := setupTestSimulator(t)
+	sim, eng, _, cleanup := setupTestSimulator(t)
 	defer cleanup()
 	eng.RegisterSymbol("AAPL")
 
 	ob, _ := eng.GetOrderBook("AAPL")
 	// Seed a very wide spread: bid at 14000, ask at 16000 (spread = 2000, step = 10)
-	ob.ProcessOrderWithWAL(&engine.Order{
+	ob.ProcessOrder(&engine.Order{
 		ID:        1,
 		Symbol:    "AAPL",
 		Side:      engine.Buy,
@@ -204,8 +193,8 @@ func TestSimulatorNarrowsWideSpread(t *testing.T) {
 		Price:     14000,
 		Amount:    10,
 		Timestamp: time.Now().UnixMilli(),
-	}, wal)
-	ob.ProcessOrderWithWAL(&engine.Order{
+	})
+	ob.ProcessOrder(&engine.Order{
 		ID:        2,
 		Symbol:    "AAPL",
 		Side:      engine.Sell,
@@ -213,7 +202,7 @@ func TestSimulatorNarrowsWideSpread(t *testing.T) {
 		Price:     16000,
 		Amount:    10,
 		Timestamp: time.Now().UnixMilli(),
-	}, wal)
+	})
 	eng.SetMinOrderID(2)
 
 	// Execute several simulation steps

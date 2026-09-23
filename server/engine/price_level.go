@@ -1,21 +1,31 @@
 package engine
 
-// PriceLevel represents all orders queued at a specific price
+// PriceLevel represents a FIFO queue of orders resting at a specific price point.
+//
+// Engineering Design Note (Intrusive Doubly Linked List):
+// Standard queue implementations (such as Go's container/list or slice queues)
+// either incur extra heap allocations per node or require O(N) linear scans
+// for arbitrary mid-queue cancellations.
+//
+// By embedding Prev and Next pointers directly inside the Order struct (an intrusive DLL):
+// 1. AddOrder (Enqueue to Tail): O(1) time, 0 extra heap allocations.
+// 2. Head Match (Dequeue from Head): O(1) time.
+// 3. CancelOrder (Unlink by ID): O(1) time using the Order reference from ob.Orders map.
 type PriceLevel struct {
-	Price       uint64
-	TotalVolume uint64
-	Head        *Order
-	Tail        *Order
+	Price       uint64 // Price in fixed-point cents/ticks
+	TotalVolume uint64 // Aggregate shares available at this level
+	Head        *Order // Earliest arriving order (FIFO priority)
+	Tail        *Order // Most recently placed order
 }
 
-// NewPriceLevel creates a new PriceLevel for a given price
+// NewPriceLevel creates a new PriceLevel for a given price.
 func NewPriceLevel(price uint64) *PriceLevel {
 	return &PriceLevel{
 		Price: price,
 	}
 }
 
-// AddOrder appends an order to the back of the queue (Tail) - O(1)
+// AddOrder appends an order to the back of the queue (Tail) in O(1) time.
 func (pl *PriceLevel) AddOrder(order *Order) {
 	pl.TotalVolume += order.Amount
 

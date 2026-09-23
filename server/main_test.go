@@ -29,6 +29,7 @@ func setupTestServer(t *testing.T) (*engine.Engine, *Hub, *engine.WAL, func()) {
 
 	eng.RegisterSymbol("AAPL")
 	eng.RegisterSymbol("TSLA")
+	eng.SetWAL(wal)
 
 	cleanup := func() {
 		hub.Stop()
@@ -39,10 +40,10 @@ func setupTestServer(t *testing.T) (*engine.Engine, *Hub, *engine.WAL, func()) {
 }
 
 func TestHandlePlaceOrder(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	handler := handlePlaceOrder(eng, hub, wal)
+	handler := handlePlaceOrder(eng, hub)
 
 	// 1. Valid resting Limit Buy order
 	orderPayload := map[string]interface{}{
@@ -171,10 +172,10 @@ func TestHandlePlaceOrder(t *testing.T) {
 }
 
 func TestHandleMarketOrderVariations(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	handler := handlePlaceOrder(eng, hub, wal)
+	handler := handlePlaceOrder(eng, hub)
 
 	// Market order on empty book -> status UNFILLED
 	mktPayload := map[string]interface{}{
@@ -236,11 +237,11 @@ func TestHandleMarketOrderVariations(t *testing.T) {
 }
 
 func TestHandleCancelOrder(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	placeHandler := handlePlaceOrder(eng, hub, wal)
-	cancelHandler := handleCancelOrder(eng, hub, wal)
+	placeHandler := handlePlaceOrder(eng, hub)
+	cancelHandler := handleCancelOrder(eng, hub)
 
 	// Place an order to cancel
 	orderPayload := map[string]interface{}{
@@ -293,7 +294,7 @@ func TestHandleCancelOrder(t *testing.T) {
 }
 
 func TestHandleGetOrderBook(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
 	bookHandler := handleGetOrderBook(eng)
@@ -307,7 +308,7 @@ func TestHandleGetOrderBook(t *testing.T) {
 	}
 
 	// 2. Existing symbol with an order
-	placeHandler := handlePlaceOrder(eng, hub, wal)
+	placeHandler := handlePlaceOrder(eng, hub)
 	orderPayload := map[string]interface{}{
 		"symbol": "AAPL",
 		"side":   0,
@@ -340,10 +341,10 @@ func TestHandleGetOrderBook(t *testing.T) {
 }
 
 func TestSimulatorEndpoints(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	sim := NewMarketSimulator(eng, hub, wal)
+	sim := NewMarketSimulator(eng, hub)
 
 	toggleHandler := func(w http.ResponseWriter, r *http.Request) {
 		running := sim.Toggle()
@@ -387,22 +388,22 @@ func TestSimulatorEndpoints(t *testing.T) {
 }
 
 func TestPlaceOrderRejectsClientSuppliedID(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 	body := `{"id":101,"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":1}`
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	handlePlaceOrder(eng, hub, wal)(rec, req)
+	handlePlaceOrder(eng, hub)(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for client-supplied id, got %d", rec.Code)
 	}
 }
 
 func TestPlaceOrderResponseReportsSubmittedAmount(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
-	h := handlePlaceOrder(eng, hub, wal)
+	h := handlePlaceOrder(eng, hub)
 	post := func(body string) map[string]interface{} {
 		req := httptest.NewRequest("POST", "/order", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
@@ -423,21 +424,21 @@ func TestPlaceOrderResponseReportsSubmittedAmount(t *testing.T) {
 }
 
 func TestPlaceOrderRequiresJSONContentType(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":1,"amount":1}`))
 	req.Header.Set("Content-Type", "text/plain")
 	rec := httptest.NewRecorder()
-	handlePlaceOrder(eng, hub, wal)(rec, req)
+	handlePlaceOrder(eng, hub)(rec, req)
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("expected 415, got %d", rec.Code)
 	}
 }
 
 func TestStateChangingRoutesRejectForeignOrigin(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
-	h := requireAllowedOrigin(handlePlaceOrder(eng, hub, wal))
+	h := requireAllowedOrigin(handlePlaceOrder(eng, hub))
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":1,"amount":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://evil.example")
@@ -456,20 +457,20 @@ func TestPlaceOrderWALFailureReturns503(t *testing.T) {
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	handlePlaceOrder(eng, hub, wal)(rec, req)
+	handlePlaceOrder(eng, hub)(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 on WAL failure, got %d", rec.Code)
 	}
 }
 
 func TestPlaceOrderRejectsOversizedPayload(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 	huge := strings.Repeat("x", 2*1024*1024)
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","pad":"`+huge+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	handlePlaceOrder(eng, hub, wal)(rec, req)
+	handlePlaceOrder(eng, hub)(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for oversized body, got %d", rec.Code)
 	}
@@ -487,9 +488,9 @@ func TestGetOrderBookRequiresSymbol(t *testing.T) {
 }
 
 func TestOriginCheckRejectsLocalhostOnRemoteHost(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
-	h := requireAllowedOrigin(handlePlaceOrder(eng, hub, wal))
+	h := requireAllowedOrigin(handlePlaceOrder(eng, hub))
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":1,"amount":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "http://localhost:3000")
@@ -513,12 +514,11 @@ func TestPublishOrderEventsBroadcastsBookUpdateOnMatch(t *testing.T) {
 	hub.register <- client
 	time.Sleep(10 * time.Millisecond)
 
-	fn := publishOrderEvents(hub, "AAPL")
 	// Simulate market sweep (trades occurred, rested = false)
 	trades := []*engine.Trade{
 		{Symbol: "AAPL", Amount: 5, Price: 15000},
 	}
-	fn(trades, false)
+	publishOrderEvents(hub, "AAPL", trades, false)
 
 	// We should receive 2 messages: trades AND book_update
 	receivedTrades := false
@@ -545,7 +545,7 @@ func TestPublishOrderEventsBroadcastsBookUpdateOnMatch(t *testing.T) {
 }
 
 func TestHandleGetTrades(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
 	// 1. Missing symbol -> 400
@@ -565,7 +565,7 @@ func TestHandleGetTrades(t *testing.T) {
 	}
 
 	// 3. Known symbol with trades
-	placeHandler := handlePlaceOrder(eng, hub, wal)
+	placeHandler := handlePlaceOrder(eng, hub)
 	// Resting ask
 	req = httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":1,"type":0,"price":15000,"amount":10}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -597,7 +597,7 @@ func TestHandleGetTrades(t *testing.T) {
 }
 
 func TestHandleGetOrders(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
 	// 1. Missing symbol -> 400
@@ -617,7 +617,7 @@ func TestHandleGetOrders(t *testing.T) {
 	}
 
 	// 3. Place resting order and fetch /orders
-	placeHandler := handlePlaceOrder(eng, hub, wal)
+	placeHandler := handlePlaceOrder(eng, hub)
 	req = httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":14000,"amount":8}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
@@ -641,7 +641,7 @@ func TestHandleGetOrders(t *testing.T) {
 }
 
 func TestHandleCancelOrderBroadcastsBothEvents(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
 	client := &Client{
@@ -651,8 +651,8 @@ func TestHandleCancelOrderBroadcastsBothEvents(t *testing.T) {
 	hub.register <- client
 	time.Sleep(10 * time.Millisecond)
 
-	placeHandler := handlePlaceOrder(eng, hub, wal)
-	cancelHandler := handleCancelOrder(eng, hub, wal)
+	placeHandler := handlePlaceOrder(eng, hub)
+	cancelHandler := handleCancelOrder(eng, hub)
 
 	// Place order
 	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":14000,"amount":8}`))
@@ -706,10 +706,10 @@ func TestHandleCancelOrderBroadcastsBothEvents(t *testing.T) {
 }
 
 func TestHandleCancelOrderInvalidID(t *testing.T) {
-	eng, hub, wal, cleanup := setupTestServer(t)
+	eng, hub, _, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	cancelHandler := handleCancelOrder(eng, hub, wal)
+	cancelHandler := handleCancelOrder(eng, hub)
 
 	// Non-numeric ID
 	req := httptest.NewRequest("DELETE", "/order?symbol=AAPL&id=abc", nil)
@@ -765,5 +765,32 @@ func TestHandleOptionsPreflight(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for disallowed origin, got %d", recDisallowed.Code)
 	}
 }
+
+func TestCancelOrderWALFailureReturns503(t *testing.T) {
+	eng, hub, wal, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Place order while WAL is operational
+	req := httptest.NewRequest("POST", "/order", strings.NewReader(`{"symbol":"AAPL","side":0,"type":0,"price":15000,"amount":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handlePlaceOrder(eng, hub)(rec, req)
+
+	var placeResp map[string]interface{}
+	json.Unmarshal(rec.Body.Bytes(), &placeResp)
+	orderID := uint64(placeResp["order"].(map[string]interface{})["id"].(float64))
+
+	// Close WAL so cancellation logging fails
+	wal.Close()
+
+	cancelURL := fmt.Sprintf("/order?symbol=AAPL&id=%d", orderID)
+	req = httptest.NewRequest("DELETE", cancelURL, nil)
+	rec = httptest.NewRecorder()
+	handleCancelOrder(eng, hub)(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on WAL failure during cancel, got %d", rec.Code)
+	}
+}
+
 
 
