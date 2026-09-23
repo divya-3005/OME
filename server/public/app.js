@@ -1229,12 +1229,9 @@ async function hydrateTradeHistory(symbol) {
 
 
 connectWebSocket();
-syncBotStatus();
-SYMBOLS.forEach(sym => {
-  hydrateTradeHistory(sym);
-});
 updateTotal();
 updateOHLCHeader();
 renderTickerForActiveSymbol();
 renderTradesStream();
 renderPriceChart();
+

@@ -136,7 +136,7 @@ go test -bench=. -benchmem -run=^$ ./...
 
 | Status Code | Reason |
 | :--- | :--- |
-| `400 Bad Request` | Invalid order payload, missing required query params (`symbol`, `id`), client-supplied `id`, or payload > 1MB |
+| `400 Bad Request` | Invalid order payload, missing required query params on DELETE (`symbol`, `id`), client-supplied `id` in POST body, or payload > 1MB |
 | `403 Forbidden` | Origin header not allowed (state-changing browser requests) |
 | `404 Not Found` | Unknown symbol, or order ID not found for cancellation (`DELETE /order`) |
 | `409 Conflict` | Duplicate order ID (internal engine safeguard) |
@@ -167,7 +167,7 @@ curl -X POST http://localhost:8080/order \
     "amount": 5
   }'
 ```
-*(Notes: `side: 0` = Buy, `side: 1` = Sell. `type: 0` = Limit, `type: 1` = Market. Price is in cents. Order IDs are assigned server-side).*
+*(Notes: `side: 0` = Buy, `side: 1` = Sell. `type: 0` = Limit, `type: 1` = Market. Price is in cents. Order IDs are assigned server-side; supplying `id` in the POST body returns 400).*
 
 ### 2. View Order Book Depth
 `GET /orderbook?symbol=AAPL`
@@ -195,3 +195,18 @@ curl "http://localhost:8080/orders?symbol=AAPL"
 
 ### 6. Real-Time WebSocket Stream
 Connect to `ws://localhost:8080/ws`. Receives one JSON object per frame: `trades` (`data` = array of trades), `book_update` (liquidity or depth changed; refetch `/orderbook`), and `order_cancelled`.
+
+### 7. Toggle Market Simulator Bot
+`POST /simulator/toggle`
+```bash
+curl -X POST http://localhost:8080/simulator/toggle
+```
+Toggles the automated background market simulation bot on or off. Returns `{"running": true}` or `{"running": false}`.
+
+### 8. Get Market Simulator Status
+`GET /simulator/status`
+```bash
+curl "http://localhost:8080/simulator/status"
+```
+Returns `{"running": true}` if the background market simulator is active, or `{"running": false}` if paused.
+

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -59,8 +60,13 @@ type WAL struct {
 	broken error // once set, the log can no longer be trusted and every append fails
 }
 
-// OpenWAL opens or creates the WAL log file.
+// OpenWAL opens or creates the WAL log file, ensuring parent directories exist.
 func OpenWAL(path string) (*WAL, error) {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, err
+		}
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
