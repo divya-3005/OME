@@ -84,13 +84,14 @@ func main() {
 		}
 	}
 
-	// Order matters: stop accepting requests, stop the bot, then close the WAL.
+	// Order matters: stop accepting requests, stop the bot, notify & close WS clients, then close the WAL.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP shutdown: %v", err)
 	}
 	sim.Stop()
+	hub.Stop()
 	if err := wal.Close(); err != nil {
 		log.Printf("WAL close: %v", err)
 		exitCode = 1
@@ -165,7 +166,12 @@ func handleWebSocket(hub *Hub) http.HandlerFunc {
 			conn: conn,
 			send: make(chan []byte, sendBufferSize),
 		}
-		hub.register <- client
+		select {
+		case hub.register <- client:
+		case <-hub.stop:
+			conn.Close()
+			return
+		}
 		go client.writePump()
 		go client.readPump()
 	}

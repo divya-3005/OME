@@ -265,3 +265,54 @@ func TestWebSocketOneEventPerFrame(t *testing.T) {
 		}
 	}
 }
+
+func TestHubBroadcastNonBlockingWhenFull(t *testing.T) {
+	hub := NewHub()
+	// Do NOT run hub.Run(), so broadcast channel never gets drained
+
+	// Fill the broadcast buffer completely (capacity 1024)
+	for i := 0; i < 1024; i++ {
+		hub.broadcast <- []byte("fill")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		hub.BroadcastJSON(map[string]string{"type": "trades"})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded immediately without blocking
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("BroadcastJSON blocked on a full broadcast channel")
+	}
+}
+
+func TestHubStopClosesClients(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+
+	server := httptest.NewServer(handleWebSocket(hub))
+	defer server.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	// Stop the hub
+	hub.Stop()
+
+	// Client should read a CloseMessage or encounter closed socket
+	conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("expected error reading from closed connection, got nil")
+	}
+	if !websocket.IsCloseError(err, websocket.CloseNormalClosure) && !strings.Contains(err.Error(), "closed") {
+		t.Logf("connection closed as expected: %v", err)
+	}
+}

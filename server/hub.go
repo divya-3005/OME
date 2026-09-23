@@ -56,7 +56,10 @@ type Client struct {
 
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		select {
+		case c.hub.unregister <- c:
+		case <-c.hub.stop:
+		}
 		c.conn.Close()
 	}()
 	c.conn.SetReadLimit(maxMessageSize)
@@ -107,6 +110,8 @@ type Hub struct {
 	broadcast  chan []byte
 	register   chan *Client
 	unregister chan *Client
+	stop       chan struct{}
+	done       chan struct{}
 }
 
 // NewHub creates a new Hub instance
@@ -116,13 +121,29 @@ func NewHub() *Hub {
 		broadcast:  make(chan []byte, 1024),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
 // Run listens on channels and handles client connections & non-blocking broadcasts
 func (h *Hub) Run() {
+	defer close(h.done)
 	for {
 		select {
+		case <-h.stop:
+			for client := range h.clients {
+				client.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				_ = client.conn.WriteMessage(
+					websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "server shutting down"),
+				)
+				client.conn.Close()
+				close(client.send)
+				delete(h.clients, client)
+			}
+			return
+
 		case client := <-h.register:
 			h.clients[client] = true
 
@@ -146,12 +167,31 @@ func (h *Hub) Run() {
 	}
 }
 
-// BroadcastJSON serializes any event to JSON and sends it to all clients
+// Stop cleanly notifies and closes all connected clients, terminating the hub loop.
+func (h *Hub) Stop() {
+	select {
+	case <-h.stop:
+		return
+	default:
+		close(h.stop)
+	}
+	<-h.done
+}
+
+// BroadcastJSON serializes any event to JSON and sends it to all clients.
+// It is non-blocking to prevent broadcast backpressure from ever blocking
+// the caller (such as an order book holding its mutex).
 func (h *Hub) BroadcastJSON(v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
 		log.Printf("json marshal error: %v", err)
 		return
 	}
-	h.broadcast <- data
+	select {
+	case <-h.stop:
+		return
+	case h.broadcast <- data:
+	default:
+		log.Printf("hub: broadcast queue full (%d), dropping event to protect engine throughput", cap(h.broadcast))
+	}
 }

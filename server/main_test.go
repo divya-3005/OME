@@ -30,6 +30,7 @@ func setupTestServer(t *testing.T) (*engine.Engine, *Hub, *engine.WAL, func()) {
 	eng.RegisterSymbol("TSLA")
 
 	cleanup := func() {
+		hub.Stop()
 		wal.Close()
 	}
 

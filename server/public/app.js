@@ -598,15 +598,32 @@ window.addEventListener('resize', () => {
 // 6. Web Audio Synthesizer (Trade Execution Chime)
 // --------------------------------------------------------------------------
 let audioCtx = null;
-function playTradeSound() {
-  if (!state.audioEnabled) return;
+
+function ensureAudioContext() {
   try {
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
-    if (audioCtx.state === 'suspended') {
+    if (audioCtx && audioCtx.state === 'suspended') {
       audioCtx.resume();
     }
+  } catch (e) {
+    // AudioContext may be restricted before user gesture
+  }
+}
+
+// Browser autoplay policy requires AudioContext creation/resumption within a direct user gesture.
+['pointerdown', 'keydown'].forEach(evt => {
+  document.addEventListener(evt, () => {
+    if (state.audioEnabled) ensureAudioContext();
+  }, { once: true });
+});
+
+function playTradeSound() {
+  if (!state.audioEnabled) return;
+  try {
+    ensureAudioContext();
+    if (!audioCtx || audioCtx.state !== 'running') return;
 
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
@@ -1115,6 +1132,9 @@ btnToggleBot.addEventListener('click', async () => {
 btnToggleAudio.addEventListener('click', () => {
   state.audioEnabled = !state.audioEnabled;
   btnToggleAudio.textContent = state.audioEnabled ? '🔊 AUDIO: ON' : '🔇 AUDIO: OFF';
+  if (state.audioEnabled) {
+    ensureAudioContext();
+  }
 });
 
 btnSubmitOrder.addEventListener('click', submitOrder);
