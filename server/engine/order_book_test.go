@@ -169,29 +169,79 @@ func TestDuplicateOrderID(t *testing.T) {
 func BenchmarkProcessOrder(b *testing.B) {
 	ob := NewOrderBook("AAPL")
 
-	// Pre-populate with 1,000 resting sell orders
+	nextID := uint64(1)
 	for i := 0; i < 1000; i++ {
 		_, _ = ob.ProcessOrder(&Order{
-			ID:        uint64(i + 1),
+			ID:        nextID,
 			Symbol:    "AAPL",
 			Side:      Sell,
 			Price:     uint64(100 + (i % 10)),
 			Amount:    10,
 			Timestamp: int64(i),
 		})
+		nextID++
 	}
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
 		_, _ = ob.ProcessOrder(&Order{
-			ID:        uint64(10000 + i),
+			ID:        nextID,
 			Symbol:    "AAPL",
 			Side:      Buy,
+			Type:      Limit,
 			Price:     105,
 			Amount:    1,
 			Timestamp: int64(i),
 		})
+		nextID++
+
+		// Replenish the unit of ask liquidity just consumed so the book
+		// never runs dry and the matching path is exercised for the
+		// entire benchmark, not just the first ~10,000 iterations.
+		_, _ = ob.ProcessOrder(&Order{
+			ID:        nextID,
+			Symbol:    "AAPL",
+			Side:      Sell,
+			Type:      Limit,
+			Price:     uint64(100 + (i % 10)),
+			Amount:    1,
+			Timestamp: int64(i),
+		})
+		nextID++
+	}
+}
+
+func BenchmarkProcessOrderWithWAL(b *testing.B) {
+	dir := b.TempDir()
+	wal, err := OpenWAL(dir + "/bench_wal.log")
+	if err != nil {
+		b.Fatalf("failed to open WAL: %v", err)
+	}
+	defer wal.Close()
+
+	ob := NewOrderBook("AAPL")
+	nextID := uint64(1)
+	for i := 0; i < 1000; i++ {
+		_, _ = ob.ProcessOrderWithWAL(&Order{
+			ID: nextID, Symbol: "AAPL", Side: Sell,
+			Price: uint64(100 + (i % 10)), Amount: 10, Timestamp: int64(i),
+		}, wal)
+		nextID++
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = ob.ProcessOrderWithWAL(&Order{
+			ID: nextID, Symbol: "AAPL", Side: Buy, Type: Limit,
+			Price: 105, Amount: 1, Timestamp: int64(i),
+		}, wal)
+		nextID++
+		_, _ = ob.ProcessOrderWithWAL(&Order{
+			ID: nextID, Symbol: "AAPL", Side: Sell, Type: Limit,
+			Price: uint64(100 + (i % 10)), Amount: 1, Timestamp: int64(i),
+		}, wal)
+		nextID++
 	}
 }
 

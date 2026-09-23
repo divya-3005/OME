@@ -96,6 +96,11 @@ func (w *WAL) Recover(eng *Engine) (uint64, error) {
 					break
 				}
 
+				if entry.Action == "PLACE" && entry.Order == nil {
+					log.Printf("WAL recovery: detected PLACE entry with missing order payload at offset %d. Truncating file tail to clean state.", validOffset)
+					break
+				}
+
 				switch entry.Action {
 				case "PLACE":
 					eng.RegisterSymbol(entry.Order.Symbol)

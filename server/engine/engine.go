@@ -20,7 +20,10 @@ func NewEngine() *Engine {
 	}
 }
 
-// NextOrderID generates a monotonic unique order ID across all symbols
+// NextOrderID generates a monotonically increasing ID. It guarantees
+// uniqueness only among IDs it issues itself; it does not prevent a caller
+// from supplying an explicit order.ID that collides with a value this
+// method later produces, or that is reused across two different symbols.
 func (e *Engine) NextOrderID() uint64 {
 	return atomic.AddUint64(&e.nextOrderID, 1)
 }

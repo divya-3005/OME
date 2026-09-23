@@ -102,8 +102,10 @@ func (ob *OrderBook) matchBuyOrder(order *Order) []*Trade {
 			bestAsk.TotalVolume -= tradeAmount
 
 			trades = append(trades, &Trade{
+				Symbol:       ob.Symbol,
 				MakerOrderID: currMaker.ID,
 				TakerOrderID: order.ID,
+				Side:         order.Side, // taker is buying
 				Amount:       tradeAmount,
 				Price:        currMaker.Price,
 				Timestamp:    time.Now().UnixNano(),
@@ -162,8 +164,10 @@ func (ob *OrderBook) matchSellOrder(order *Order) []*Trade {
 			bestBid.TotalVolume -= tradeAmount
 
 			trades = append(trades, &Trade{
+				Symbol:       ob.Symbol,
 				MakerOrderID: currMaker.ID,
 				TakerOrderID: order.ID,
+				Side:         order.Side,
 				Amount:       tradeAmount,
 				Price:        currMaker.Price,
 				Timestamp:    time.Now().UnixNano(),

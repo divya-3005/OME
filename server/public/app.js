@@ -11,12 +11,10 @@ const state = {
   ws: null,
   audioEnabled: true,
   botRunning: true,
-  stats: {
-    high: 152.80,
-    low: 148.50,
-    volume: 1420580,
-    tradesCount: 0,
-    openPrice: 147.85,
+  statsBySymbol: {
+    'AAPL':    { high: 152.80,   low: 148.50,   volume: 1420580, tradesCount: 0, openPrice: 147.85,    lastPrice: 147.85 },
+    'TSLA':    { high: 245.50,   low: 238.10,   volume: 0,       tradesCount: 0, openPrice: 242.00,    lastPrice: 242.00 },
+    'BTC-USD': { high: 64800.00, low: 62900.00, volume: 0,       tradesCount: 0, openPrice: 63200.00, lastPrice: 63200.00 },
   },
   lastBook: { bids: [], asks: [] },
   hoverPriceChart: null, // { x, y } when mouse is over price canvas
@@ -721,17 +719,27 @@ function connectWebSocket() {
 }
 
 function handleServerEvent(msg) {
-  if (msg.type === 'trades' && msg.symbol === state.activeSymbol) {
-    msg.data.forEach(trade => {
-      appendTrade(trade);
-      const p = trade.price / 100;
-      updateCandleOnTrade(state.activeSymbol, p, trade.amount);
-    });
-    fetchOrderBook();
+  if (msg.type === 'trades') {
+    // Reconcile the user's own resting orders regardless of active tab,
+    // so myOrders never goes stale for symbols not currently in view.
     updateOpenOrdersAfterMatch(msg.data);
-    playTradeSound();
-  } else if (msg.type === 'order_cancelled' && msg.symbol === state.activeSymbol) {
-    fetchOrderBook();
+
+    if (msg.symbol === state.activeSymbol) {
+      msg.data.forEach(trade => {
+        appendTrade(trade);
+        const p = trade.price / 100;
+        updateCandleOnTrade(state.activeSymbol, p, trade.amount);
+      });
+      fetchOrderBook();
+      playTradeSound();
+    }
+  } else if (msg.type === 'order_cancelled') {
+    state.myOrders = state.myOrders.filter(o => o.id !== msg.order_id);
+    renderOpenOrders();
+
+    if (msg.symbol === state.activeSymbol) {
+      fetchOrderBook();
+    }
   }
 }
 
@@ -834,7 +842,7 @@ window.setPrice = function(price) {
 function appendTrade(trade) {
   const price = (trade.price / 100).toFixed(2);
   const time = new Date(trade.timestamp / 1000000).toLocaleTimeString();
-  const sideClass = state.side === 0 ? 'buy' : 'sell';
+  const sideClass = trade.side === 0 ? 'buy' : 'sell';
 
   const row = document.createElement('div');
   row.className = 'trade-row';
@@ -857,23 +865,40 @@ function appendTrade(trade) {
   lastTradedPrice.textContent = `$${price}`;
   tickerLastPrice.textContent = `$${price}`;
 
+  const stats = state.statsBySymbol[state.activeSymbol];
   const numPrice = parseFloat(price);
-  if (numPrice > state.stats.high) state.stats.high = numPrice;
-  if (numPrice < state.stats.low) state.stats.low = numPrice;
-  state.stats.volume += trade.amount;
-  state.stats.tradesCount++;
+  stats.lastPrice = numPrice;
+  if (numPrice > stats.high) stats.high = numPrice;
+  if (numPrice < stats.low) stats.low = numPrice;
+  stats.volume += trade.amount;
+  stats.tradesCount++;
 
-  const pctChange = (((numPrice - state.stats.openPrice) / state.stats.openPrice) * 100).toFixed(2);
+  const pctChange = (((numPrice - stats.openPrice) / stats.openPrice) * 100).toFixed(2);
   tickerChange.textContent = `${pctChange >= 0 ? '+' : ''}${pctChange}%`;
   tickerChange.className = `ticker-val ${pctChange >= 0 ? 'text-green' : 'text-red'}`;
 
-  tickerHigh.textContent = `$${state.stats.high.toFixed(2)}`;
-  tickerLow.textContent = `$${state.stats.low.toFixed(2)}`;
-  tickerVolume.textContent = state.stats.volume.toLocaleString();
-  tickerTradesCount.textContent = state.stats.tradesCount.toLocaleString();
+  tickerHigh.textContent = `$${stats.high.toFixed(2)}`;
+  tickerLow.textContent = `$${stats.low.toFixed(2)}`;
+  tickerVolume.textContent = stats.volume.toLocaleString();
+  tickerTradesCount.textContent = stats.tradesCount.toLocaleString();
 
   const activeTabPrice = document.getElementById(`tabPrice-${state.activeSymbol}`);
   if (activeTabPrice) activeTabPrice.textContent = `$${price}`;
+}
+
+function renderTickerForActiveSymbol() {
+  const stats = state.statsBySymbol[state.activeSymbol];
+  tickerLastPrice.textContent = `$${stats.lastPrice.toFixed(2)}`;
+  lastTradedPrice.textContent = `$${stats.lastPrice.toFixed(2)}`;
+
+  tickerHigh.textContent = `$${stats.high.toFixed(2)}`;
+  tickerLow.textContent = `$${stats.low.toFixed(2)}`;
+  tickerVolume.textContent = stats.volume.toLocaleString();
+  tickerTradesCount.textContent = stats.tradesCount.toLocaleString();
+
+  const pctChange = (((stats.lastPrice - stats.openPrice) / stats.openPrice) * 100).toFixed(2);
+  tickerChange.textContent = `${pctChange >= 0 ? '+' : ''}${pctChange}%`;
+  tickerChange.className = `ticker-val ${pctChange >= 0 ? 'text-green' : 'text-red'}`;
 }
 
 // --------------------------------------------------------------------------
@@ -896,10 +921,7 @@ async function submitOrder() {
     price = Math.round(rawPrice * 100);
   }
 
-  const orderId = Date.now() + Math.floor(Math.random() * 1000);
-
   const payload = {
-    id: orderId,
     symbol: state.activeSymbol,
     side: state.side,
     type: state.type,
@@ -1061,20 +1083,12 @@ symbolTabs.addEventListener('click', (e) => {
 
   if (state.activeSymbol === 'AAPL') {
     inputPrice.value = '150.00';
-    state.stats.openPrice = 147.85;
-    state.stats.high = 152.80;
-    state.stats.low = 148.50;
   } else if (state.activeSymbol === 'TSLA') {
     inputPrice.value = '240.00';
-    state.stats.openPrice = 242.00;
-    state.stats.high = 245.50;
-    state.stats.low = 238.10;
   } else if (state.activeSymbol === 'BTC-USD') {
     inputPrice.value = '64000.00';
-    state.stats.openPrice = 63200.00;
-    state.stats.high = 64800.00;
-    state.stats.low = 62900.00;
   }
+  renderTickerForActiveSymbol();
 
   updateTotal();
   updateOHLCHeader();
@@ -1115,4 +1129,5 @@ btnSubmitOrder.addEventListener('click', submitOrder);
 connectWebSocket();
 updateTotal();
 updateOHLCHeader();
+renderTickerForActiveSymbol();
 renderPriceChart();

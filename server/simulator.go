@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -54,7 +55,9 @@ func (sim *MarketSimulator) SeedSymbol(symbol string) {
 			Amount:    qty,
 			Timestamp: time.Now().UnixNano(),
 		}
-		sim.eng.ProcessOrderWithWAL(order, sim.wal)
+		if _, err := sim.eng.ProcessOrderWithWAL(order, sim.wal); err != nil {
+			log.Printf("simulator: failed to seed order %d for %s: %v", order.ID, symbol, err)
+		}
 	}
 
 	// Create 10 Asks above mid price
@@ -71,7 +74,9 @@ func (sim *MarketSimulator) SeedSymbol(symbol string) {
 			Amount:    qty,
 			Timestamp: time.Now().UnixNano(),
 		}
-		sim.eng.ProcessOrderWithWAL(order, sim.wal)
+		if _, err := sim.eng.ProcessOrderWithWAL(order, sim.wal); err != nil {
+			log.Printf("simulator: failed to seed order %d for %s: %v", order.ID, symbol, err)
+		}
 	}
 }
 

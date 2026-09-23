@@ -8,25 +8,26 @@ A low-latency, multi-asset financial order matching engine and institutional tra
 
 ## ⚡ Performance & Benchmarks
 
-The benchmark measures the isolated in-memory matching algorithm (`ProcessOrder`) under a single thread on an Apple M3 (8-core ARM64) using Go 1.22+:
+Benchmarked on an Apple M3 (8-core ARM64) using Go 1.22 (see server/go.mod):
 
 | Metric | In-Memory Engine Benchmark | Details |
 | :--- | :--- | :--- |
-| **Engine-Level Throughput** | **~5.3 Million orders / sec** | In-memory matching loop |
-| **Mean Execution Latency** | **188.5 ns / operation** | Sub-microsecond core matching |
-| **Memory Allocation** | **154 B / op** | Intrusive DLL avoids separate node allocations |
-| **GC Overhead** | **1 allocation / op** | Single heap allocation per order lifecycle |
+| **Engine-Level Throughput** | **~2.64M iterations/s (~5.3M orders/s)** | Sustained 2-order match + replenish loop |
+| **Mean Execution Latency** | **378.7 ns / op (~189 ns / order)** | Sub-microsecond match + replenish cycle |
+| **Memory Allocation** | **247 B / op** | Intrusive DLL avoids separate node allocations |
+| **Allocations** | **3 allocs / op** | Single heap allocation per order lifecycle + trade slice |
 
 ```bash
 goos: darwin
 goarch: arm64
 pkg: github.com/divya-3005/OME/server/engine
 cpu: Apple M3
-BenchmarkProcessOrder-8   8112890   188.5 ns/op   154 B/op   1 allocs/op
+BenchmarkProcessOrder-8          	 3438768	       378.7 ns/op	     247 B/op	       3 allocs/op
+BenchmarkProcessOrderWithWAL-8   	     213	   5760254 ns/op	     552 B/op	       8 allocs/op
 PASS
 ```
 
-> **Note on Benchmark Methodology**: The 188.5 ns/op figure reflects the mean latency of a single `ProcessOrder` execution in memory. It is not an end-to-end figure through the HTTP layer, JSON deserialization, disk WAL fsync, and WebSocket fan-out, where throughput is bounded by network and disk I/O rather than the matching algorithm itself.
+> **Note on Benchmark Methodology**: The 378.7 ns/op figure reflects the mean latency of an active matching cycle (one incoming aggressor order matched against the book + one replenishment limit order) in memory. It is not an end-to-end figure through the HTTP layer, JSON deserialization, disk WAL fsync, and WebSocket fan-out, where throughput is bounded by network and disk I/O rather than the matching algorithm itself. For disk-persisted durability, `BenchmarkProcessOrderWithWAL` measures the synchronous Write-Ahead Log path with atomic `fsync` per transaction.
 
 ---
 
@@ -51,9 +52,9 @@ graph TD
 ### 1. Sorted Price Levels with $O(\log P)$ Search & $O(1)$ FIFO Queues
 - **Price Levels**: Maintained in sorted order (bids descending, asks ascending) using binary search lookup ($O(\log P)$) with slice insertion shift ($O(P)$).
 - **Intrusive Doubly Linked Lists**: Orders at each price level form an intrusive FIFO queue:
-  - **Add to queue**: Appended to tail in **$O(1)$**.
+  - **Add to queue**: Appended to tail in **$O(1)$** once the price level exists.
   - **Pop match**: Extracted from head in **$O(1)$**.
-  - **Cancel order**: Unlinked directly in **$O(1)$** without array shifting or linear scans.
+  - **Cancel order**: Unlinked from its price level in **$O(1)$**. Creating a brand-new price level, or removing one that's been fully drained, is **$O(\log P)$** to locate plus **$O(P)$** to shift the sorted price-level slice, where $P$ is the number of distinct resting price levels for that symbol.
 - **Garbage-Collector Safe**: Pointer references are explicitly zeroed during level eviction, preventing backing-array memory retention.
 
 ### 2. $O(1)$ Order Cancellations & Unified ID Namespace
