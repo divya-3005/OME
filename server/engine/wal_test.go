@@ -323,3 +323,17 @@ func TestWALInvalidOrderPayloadRecovery(t *testing.T) {
 	}
 }
 
+func TestWALCreatesParentDirectories(t *testing.T) {
+	nestedPath := filepath.Join(t.TempDir(), "nested", "sub", "wal.log")
+	wal, err := OpenWAL(nestedPath)
+	if err != nil {
+		t.Fatalf("expected OpenWAL to create parent directories, got error: %v", err)
+	}
+	defer wal.Close()
+
+	if err := wal.LogPlace(&Order{ID: 1, Symbol: "AAPL", Side: Buy, Type: Limit, Price: 100, Amount: 10}); err != nil {
+		t.Fatalf("failed to log order in nested WAL: %v", err)
+	}
+}
+
+

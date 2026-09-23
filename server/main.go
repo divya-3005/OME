@@ -67,6 +67,8 @@ func main() {
 	log.Println("Market Simulator active: simulating live institutional order flow")
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("OPTIONS /order", handleOptions)
+	mux.HandleFunc("OPTIONS /simulator/toggle", handleOptions)
 	mux.HandleFunc("POST /order", requireAllowedOrigin(handlePlaceOrder(eng, hub, wal)))
 	mux.HandleFunc("DELETE /order", requireAllowedOrigin(handleCancelOrder(eng, hub, wal)))
 	mux.HandleFunc("GET /orderbook", handleGetOrderBook(eng))
@@ -138,8 +140,25 @@ func requireAllowedOrigin(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
 		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 		next(w, r)
 	}
+}
+
+// handleOptions responds to CORS preflight requests from allowed origins.
+func handleOptions(w http.ResponseWriter, r *http.Request) {
+	if !isAllowedOrigin(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, DELETE, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func isJSONRequest(r *http.Request) bool {

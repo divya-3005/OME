@@ -739,3 +739,31 @@ func TestHandleCancelOrderInvalidID(t *testing.T) {
 	}
 }
 
+func TestHandleOptionsPreflight(t *testing.T) {
+	// 1. Allowed origin preflight returns 204 with CORS headers
+	req := httptest.NewRequest("OPTIONS", "/order", nil)
+	req.Header.Set("Origin", "http://localhost:8080")
+	req.Host = "localhost:8080"
+	rec := httptest.NewRecorder()
+	handleOptions(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content, got %d", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "http://localhost:8080" {
+		t.Errorf("expected Allow-Origin header, got %s", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// 2. Disallowed origin preflight returns 403
+	reqDisallowed := httptest.NewRequest("OPTIONS", "/order", nil)
+	reqDisallowed.Header.Set("Origin", "http://malicious.org")
+	reqDisallowed.Host = "internal-exchange.com"
+	recDisallowed := httptest.NewRecorder()
+	handleOptions(recDisallowed, reqDisallowed)
+
+	if recDisallowed.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disallowed origin, got %d", recDisallowed.Code)
+	}
+}
+
+
